@@ -4,6 +4,25 @@ from diffusers.pipelines.hunyuan_video.pipeline_hunyuan_video import DEFAULT_PRO
 from diffusers_helper.utils import crop_or_pad_yield_mask
 
 
+def _infer_module_device(module, default_device=None):
+    if default_device is not None:
+        return torch.device(default_device)
+
+    try:
+        first_param = next(module.parameters())
+        return first_param.device
+    except StopIteration:
+        pass
+
+    try:
+        first_buffer = next(module.buffers())
+        return first_buffer.device
+    except StopIteration:
+        pass
+
+    return torch.device('cpu')
+
+
 @torch.no_grad()
 def encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2, max_length=256,
                         trt_llama_encoder=None, trt_clip_encoder=None):
@@ -116,15 +135,36 @@ def vae_decode_fake(latents):
 @torch.no_grad()
 def vae_decode(latents, vae, image_mode=False):
     latents = latents / vae.config.scaling_factor
+    primary_device = getattr(vae, '_framepack_primary_device', None)
+    primary_device = _infer_module_device(vae, primary_device)
+    setattr(vae, '_framepack_primary_device', primary_device)
+    cpu_device = torch.device('cpu')
 
-    if not image_mode:
-        image = vae.decode(latents.to(device=vae.device, dtype=vae.dtype)).sample
-    else:
-        latents = latents.to(device=vae.device, dtype=vae.dtype).unbind(2)
-        image = [vae.decode(l.unsqueeze(2)).sample for l in latents]
-        image = torch.cat(image, dim=2)
+    def _decode_on(device):
+        vae.to(device)
+        if not image_mode:
+            return vae.decode(latents.to(device=device, dtype=vae.dtype)).sample
+        device_latents = latents.to(device=device, dtype=vae.dtype).unbind(2)
+        decoded = [vae.decode(l.unsqueeze(2)).sample for l in device_latents]
+        return torch.cat(decoded, dim=2)
 
-    return image
+    if getattr(vae, '_framepack_force_cpu_decode', False):
+        image = _decode_on(cpu_device)
+        if primary_device != cpu_device:
+            vae.to(primary_device)
+        return image
+
+    try:
+        return _decode_on(primary_device)
+    except RuntimeError as err:
+        if 'miopen' in str(err).lower():
+            print('FramePack Warning: MIOpen convolution failure during VAE decode, retrying on CPU. This will be slower.')
+            setattr(vae, '_framepack_force_cpu_decode', True)
+            image = _decode_on(cpu_device)
+            if primary_device != cpu_device:
+                vae.to(primary_device)
+            return image
+        raise
 
 
 @torch.no_grad()
