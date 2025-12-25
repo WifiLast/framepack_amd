@@ -1,6 +1,8 @@
 # By lllyasviel
 
-from typing import Any, List, Optional
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -8,6 +10,58 @@ import torch
 cpu: torch.device = torch.device('cpu')
 gpu: torch.device = torch.device(f'cuda:{torch.cuda.current_device()}')
 gpu_complete_modules: List[torch.nn.Module] = []
+_MEM_STATS_CACHE: Dict[int, tuple[float, float]] = {}
+
+
+@dataclass
+class MemoryOptimizationConfig:
+    """Optional toggles for memory helper optimizations."""
+
+    use_async_streams: bool = False
+    use_pinned_memory: bool = False
+    cache_memory_stats: bool = False
+    stats_cache_ttl: float = 0.05
+
+    def enable_async_copy(self) -> bool:
+        return self.use_async_streams and torch.cuda.is_available()
+
+
+def _device_index(device: Optional[torch.device]) -> int:
+    if device is None:
+        return torch.cuda.current_device()
+    if isinstance(device, torch.device):
+        if device.type != "cuda":
+            raise ValueError("Expected CUDA device for memory helpers.")
+        return device.index if device.index is not None else torch.cuda.current_device()
+    return int(device)
+
+
+def _cached_available_bytes(device: torch.device, optim: Optional[MemoryOptimizationConfig]) -> float:
+    if optim is None or not optim.cache_memory_stats:
+        memory_stats = torch.cuda.memory_stats(device)
+        bytes_active = memory_stats['active_bytes.all.current']
+        bytes_reserved = memory_stats['reserved_bytes.all.current']
+        bytes_free_cuda, _ = torch.cuda.mem_get_info(device)
+        bytes_inactive_reserved = bytes_reserved - bytes_active
+        return bytes_free_cuda + bytes_inactive_reserved
+
+    now = time.perf_counter()
+    idx = _device_index(device)
+    ttl = max(0.0, optim.stats_cache_ttl)
+    cached = _MEM_STATS_CACHE.get(idx)
+    if cached:
+        ts, bytes_total = cached
+        if (now - ts) <= ttl:
+            return bytes_total
+
+    memory_stats = torch.cuda.memory_stats(device)
+    bytes_active = memory_stats['active_bytes.all.current']
+    bytes_reserved = memory_stats['reserved_bytes.all.current']
+    bytes_free_cuda, _ = torch.cuda.mem_get_info(device)
+    bytes_inactive_reserved = bytes_reserved - bytes_active
+    total = bytes_free_cuda + bytes_inactive_reserved
+    _MEM_STATS_CACHE[idx] = (now, total)
+    return total
 
 
 class DynamicSwapInstaller:
@@ -16,8 +70,7 @@ class DynamicSwapInstaller:
         original_class = module.__class__
         module.__dict__['forge_backup_original_class'] = original_class
 
-        # Store kwargs for use in hooks
-        module.__dict__['_dynamic_swap_kwargs'] = kwargs
+        original_getattr = original_class.__dict__.get('__getattr__')
 
         def hacked_get_attr(self, name: str):
             # Handle device and dtype properties first - these are computed properties on nn.Module
@@ -47,89 +100,39 @@ class DynamicSwapInstaller:
                 _buffers = self.__dict__['_buffers']
                 if name in _buffers:
                     return _buffers[name].to(**kwargs)
+            if original_getattr is not None:
+                return original_getattr(self, name)
             return super(original_class, self).__getattr__(name)
 
-        # Add forward pre-hook to move weights to target device before forward pass
-        def _pre_forward_hook(mod, inputs):
-            import sys
-            swap_kwargs = getattr(mod, '_dynamic_swap_kwargs', kwargs)
-            device = swap_kwargs.get('device', None)
-            if device is None:
-                return None
-
-            moved = 0
-            skipped = 0
-            none_params = 0
-            # Only move parameters of THIS module (not submodules)
-            # Each submodule has its own hook, so we don't need to recurse
-            for name, param in mod._parameters.items():
-                if param is None:
-                    none_params += 1
-                    continue
-                if hasattr(param, 'to'):
-                    if param.device != device:
-                        mod._parameters[name] = torch.nn.Parameter(param.to(**swap_kwargs), requires_grad=param.requires_grad)
-                        moved += 1
-                    else:
-                        skipped += 1
-
-            # Move buffers of THIS module
-            for name, buffer in mod._buffers.items():
-                if buffer is None:
-                    continue
-                if hasattr(buffer, 'to'):
-                    if buffer.device != device:
-                        mod._buffers[name] = buffer.to(**swap_kwargs)
-                        moved += 1
-                    else:
-                        skipped += 1
-
-            total_params = len(mod._parameters)
-            if moved > 0 or (moved == 0 and skipped == 0 and total_params > 0):
-                print(f"DEBUG: Hook for {mod.__class__.__name__}: moved={moved}, skipped={skipped}, none={none_params}, total={total_params}", file=sys.stderr)
-
-            return None
-
-        # Register the hook
-        handle = module.register_forward_pre_hook(_pre_forward_hook)
-        module.__dict__['_dynamic_swap_hook_handle'] = handle
-
         # Also need to ensure forward() is called with all kwargs properly
-        original_forward = original_class.forward
+        original_forward = module.forward
 
-        def hacked_forward(self, *args, **forward_kwargs):
+        def hacked_forward(self, *args, **kwargs):
             # Debug logging for LlamaModel specifically
             import sys
             if 'LlamaModel' in original_class.__name__:
-                print(f"DEBUG hacked_forward ({original_class.__name__}): kwargs = {list(forward_kwargs.keys())}", file=sys.stderr)
-                print(f"DEBUG hacked_forward: output_hidden_states = {forward_kwargs.get('output_hidden_states', 'NOT SET')}", file=sys.stderr)
+                print(f"DEBUG hacked_forward ({original_class.__name__}): kwargs = {list(kwargs.keys())}", file=sys.stderr)
+                print(f"DEBUG hacked_forward: output_hidden_states = {kwargs.get('output_hidden_states', 'NOT SET')}", file=sys.stderr)
                 print(f"DEBUG hacked_forward: config.output_hidden_states = {getattr(self.config, 'output_hidden_states', 'NO CONFIG')}", file=sys.stderr)
 
-            # Move input tensors to target device
-            swap_kwargs = getattr(self, '_dynamic_swap_kwargs', kwargs)
-            device = swap_kwargs.get('device', None)
-            if device is not None:
-                def move_to_device(obj):
-                    if isinstance(obj, torch.Tensor):
-                        if obj.device != device:
-                            return obj.to(**swap_kwargs)
-                        return obj
-                    elif isinstance(obj, (tuple, list)):
-                        return type(obj)(move_to_device(item) for item in obj)
-                    elif isinstance(obj, dict):
-                        return {k: move_to_device(v) for k, v in obj.items()}
-                    return obj
+                # CRITICAL FIX: Ensure the config is properly set before calling forward
+                # The issue is that the config might be overridden somewhere
+                if kwargs.get('output_hidden_states', False):
+                    original_config_value = self.config.output_hidden_states
+                    self.config.output_hidden_states = True
+                    print(f"DEBUG: Temporarily set config.output_hidden_states from {original_config_value} to True", file=sys.stderr)
 
-                args = move_to_device(args)
-                forward_kwargs = move_to_device(forward_kwargs)
-
-            result = original_forward(self, *args, **forward_kwargs)
+            result = original_forward(*args, **kwargs)
 
             if 'LlamaModel' in original_class.__name__:
                 has_hs = hasattr(result, 'hidden_states')
                 hs_value = result.hidden_states if has_hs else 'NO ATTR'
                 hs_is_none = hs_value is None if has_hs else 'N/A'
                 print(f"DEBUG hacked_forward: result.hidden_states exists={has_hs}, is_none={hs_is_none}", file=sys.stderr)
+
+                # If still None, check if we need to collect from layers manually
+                if has_hs and hs_value is None and hasattr(self, 'layers'):
+                    print(f"DEBUG: Attempting to manually collect hidden states", file=sys.stderr)
 
             return result
 
@@ -140,35 +143,20 @@ class DynamicSwapInstaller:
 
     @staticmethod
     def _uninstall_module(module: torch.nn.Module) -> None:
-        # Remove forward hook if it exists
-        if '_dynamic_swap_hook_handle' in module.__dict__:
-            handle = module.__dict__.pop('_dynamic_swap_hook_handle')
-            handle.remove()
-        # Remove stored kwargs
-        if '_dynamic_swap_kwargs' in module.__dict__:
-            module.__dict__.pop('_dynamic_swap_kwargs')
-        # Restore original class
         if 'forge_backup_original_class' in module.__dict__:
             module.__class__ = module.__dict__.pop('forge_backup_original_class')
 
     @staticmethod
     def install_model(model: torch.nn.Module, **kwargs: Any) -> None:
-        import sys
         # Check if this is a LlamaModel that needs hidden_states support
         is_llama = 'LlamaModel' in model.__class__.__name__
 
-        # Install hook on ALL submodules so gradient checkpointing works
-        # Each module will move its own parameters before forward
-        count = 0
         for m in model.modules():
             # For LlamaModel, skip wrapping the root model itself to avoid breaking hidden_states collection
             # Only wrap the submodules for memory optimization
             if is_llama and m is model:
                 continue
             DynamicSwapInstaller._install_module(m, **kwargs)
-            count += 1
-
-        print(f"DEBUG: Installed DynamicSwapInstaller on {count} modules for {model.__class__.__name__}", file=sys.stderr)
 
     @staticmethod
     def uninstall_model(model: torch.nn.Module) -> None:
@@ -187,16 +175,13 @@ def fake_diffusers_current_device(model: torch.nn.Module, target_device: torch.d
             return
 
 
-def get_cuda_free_memory_gb(device: Optional[torch.device] = None) -> float:
+def get_cuda_free_memory_gb(
+    device: Optional[torch.device] = None,
+    optim_config: Optional[MemoryOptimizationConfig] = None,
+) -> float:
     target = device or gpu
-
-    memory_stats = torch.cuda.memory_stats(target)
-    bytes_active = memory_stats['active_bytes.all.current']
-    bytes_reserved = memory_stats['reserved_bytes.all.current']
-    bytes_free_cuda, _ = torch.cuda.mem_get_info(target)
-    bytes_inactive_reserved = bytes_reserved - bytes_active
-    bytes_total_available = bytes_free_cuda + bytes_inactive_reserved
-    return bytes_total_available / (1024 ** 3)
+    available_bytes = _cached_available_bytes(target, optim_config)
+    return available_bytes / (1024 ** 3)
 
 
 def move_model_to_device_with_memory_preservation(
@@ -204,20 +189,21 @@ def move_model_to_device_with_memory_preservation(
     target_device: torch.device,
     preserved_memory_gb: float = 0,
     aggressive: bool = False,
+    optim_config: Optional[MemoryOptimizationConfig] = None,
 ) -> None:
     print(f'Moving {model.__class__.__name__} to {target_device} with preserved memory: {preserved_memory_gb} GB')
 
     modules_list = list(model.modules())
 
     for i, m in enumerate(modules_list):
-        free_mem = get_cuda_free_memory_gb(target_device)
+        free_mem = get_cuda_free_memory_gb(target_device, optim_config=optim_config)
 
         if free_mem <= preserved_memory_gb:
             if aggressive:
                 # Aggressive mode: clear cache and try to continue
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
-                free_mem = get_cuda_free_memory_gb(target_device)
+                free_mem = get_cuda_free_memory_gb(target_device, optim_config=optim_config)
 
                 if free_mem <= preserved_memory_gb * 0.8:
                     print(f'Stopped at module {i}/{len(modules_list)} due to memory limit')
@@ -242,13 +228,14 @@ def offload_model_from_device_for_memory_preservation(
     target_device: torch.device,
     preserved_memory_gb: float = 0,
     aggressive: bool = False,
+    optim_config: Optional[MemoryOptimizationConfig] = None,
 ) -> None:
     print(f'Offloading {model.__class__.__name__} from {target_device} to preserve memory: {preserved_memory_gb} GB')
 
     modules_list = list(model.modules())
 
     for i, m in enumerate(modules_list):
-        free_mem = get_cuda_free_memory_gb(target_device)
+        free_mem = get_cuda_free_memory_gb(target_device, optim_config=optim_config)
 
         if free_mem >= preserved_memory_gb:
             if not aggressive:
@@ -290,11 +277,13 @@ def load_model_chunked(
     model: torch.nn.Module,
     target_device: torch.device,
     max_chunk_size_mb: int = 512,
+    optim_config: Optional[MemoryOptimizationConfig] = None,
 ) -> None:
     """
     Load model to device in smaller chunks to bypass memory limits.
     Useful for extremely large models (110GB+) on limited VRAM (16GB).
     """
+    optim = optim_config or MemoryOptimizationConfig()
 
     def _chunked_to_device(tensor: torch.Tensor, dest: torch.device, chunk_bytes: int) -> torch.Tensor:
         if tensor is None:
@@ -306,6 +295,9 @@ def load_model_chunked(
             return tensor.to(device=dest)
 
         contiguous = tensor.contiguous()
+        if optim.use_pinned_memory and not contiguous.is_cuda and torch.cuda.is_available():
+            contiguous = contiguous.pin_memory()
+
         flat_src = contiguous.view(-1)
         total_elems = flat_src.numel()
         if total_elems == 0:
@@ -318,10 +310,18 @@ def load_model_chunked(
         chunk_elems = max(1, chunk_bytes // elem_bytes)
         dst = torch.empty_like(tensor, device=dest)
         flat_dst = dst.view(-1)
+        copy_stream = torch.cuda.Stream(device=dest) if optim.enable_async_copy() else None
 
         for start in range(0, total_elems, chunk_elems):
             end = min(total_elems, start + chunk_elems)
-            flat_dst[start:end].copy_(flat_src[start:end], non_blocking=False)
+            if copy_stream is not None:
+                with torch.cuda.stream(copy_stream):
+                    flat_dst[start:end].copy_(flat_src[start:end], non_blocking=True)
+            else:
+                flat_dst[start:end].copy_(flat_src[start:end], non_blocking=False)
+
+        if copy_stream is not None:
+            torch.cuda.current_stream(device=dest).wait_stream(copy_stream)
 
         return dst
 
@@ -375,7 +375,7 @@ def load_model_chunked(
     torch.cuda.empty_cache()
 
 
-def force_free_vram(target_gb: float = 2.0) -> float:
+def force_free_vram(target_gb: float = 2.0, optim_config: Optional[MemoryOptimizationConfig] = None) -> float:
     """
     Aggressively free VRAM until target_gb is available.
     """
@@ -388,7 +388,7 @@ def force_free_vram(target_gb: float = 2.0) -> float:
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
 
-    free_mem = get_cuda_free_memory_gb(gpu)
+    free_mem = get_cuda_free_memory_gb(gpu, optim_config=optim_config)
     print(f'After clearing: {free_mem:.2f} GB free')
 
     if free_mem < target_gb:
