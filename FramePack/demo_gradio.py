@@ -36,6 +36,7 @@ from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_pro
 from transformers import SiglipImageProcessor, SiglipVisionModel
 from diffusers_helper.clip_vision import hf_clip_vision_encode
 from diffusers_helper.bucket_tools import find_nearest_bucket
+import diffusers_helper.models.hunyuan_video_packed as hunyuan_attn
 
 
 parser = argparse.ArgumentParser()
@@ -55,6 +56,12 @@ high_vram = free_mem_gb > 60
 
 print(f'Free VRAM {free_mem_gb} GB')
 print(f'High-VRAM Mode: {high_vram}')
+
+hunyuan_attn.xformers_attn_func = None
+if hunyuan_attn.sageattn is not None:
+    print('SageAttention detected. Using sage-attention backend by default (xFormers disabled).')
+else:
+    print('Warning: sage-attention is not installed; falling back to other attention kernels. xFormers remains disabled by default.')
 
 text_encoder = LlamaModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder', torch_dtype=torch.float16).cpu()
 text_encoder_2 = CLIPTextModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder_2', torch_dtype=torch.float16).cpu()
