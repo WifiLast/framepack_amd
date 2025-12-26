@@ -93,8 +93,25 @@ def vae_decode_fake(latents):
 @torch.no_grad()
 def vae_decode(latents, vae, image_mode=False):
     import sys
+    import os
+    import signal
+    from contextlib import contextmanager
+
     print(f"[VAE Decode] Starting - latents shape: {latents.shape}, device: {latents.device}", file=sys.stderr, flush=True)
     print(f"[VAE Decode] VAE device: {vae.device}, VAE dtype: {vae.dtype}", file=sys.stderr, flush=True)
+
+    # Force MIOpen to use IMMEDIATE mode for VAE (prevents hanging in Find phase)
+    old_find_mode = os.environ.get('MIOPEN_FIND_MODE', '')
+    old_find_enforce = os.environ.get('MIOPEN_FIND_ENFORCE', '')
+
+    print(f"[VAE Decode] Setting MIOpen to IMMEDIATE mode to prevent Find phase hanging", file=sys.stderr, flush=True)
+    os.environ['MIOPEN_FIND_MODE'] = 'NORMAL'  # Use NORMAL but with immediate fallback
+    os.environ['MIOPEN_FIND_ENFORCE'] = 'NONE'  # Don't enforce Find, use immediate if Find fails
+
+    # Also ensure naive convolution is still available
+    os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD'] = '1'
+    os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_BWD'] = '1'
+    os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_WRW'] = '1'
 
     latents = latents / vae.config.scaling_factor
 
@@ -102,14 +119,24 @@ def vae_decode(latents, vae, image_mode=False):
         # Try GPU decode first
         if not image_mode:
             print(f"[VAE Decode] Attempting GPU decode on {vae.device}", file=sys.stderr, flush=True)
+            torch.cuda.synchronize()  # Ensure everything is ready before decode
             image = vae.decode(latents.to(device=vae.device, dtype=vae.dtype)).sample
+            torch.cuda.synchronize()  # Ensure decode completed
             print(f"[VAE Decode] GPU decode SUCCESS - result device: {image.device}, shape: {image.shape}", file=sys.stderr, flush=True)
         else:
             print(f"[VAE Decode] Attempting GPU image mode decode on {vae.device}", file=sys.stderr, flush=True)
             latents = latents.to(device=vae.device, dtype=vae.dtype).unbind(2)
             image = [vae.decode(l.unsqueeze(2)).sample for l in latents]
             image = torch.cat(image, dim=2)
+            torch.cuda.synchronize()  # Ensure decode completed
             print(f"[VAE Decode] GPU image mode decode SUCCESS - result device: {image.device}, shape: {image.shape}", file=sys.stderr, flush=True)
+
+        # Restore original MIOpen settings
+        if old_find_mode:
+            os.environ['MIOPEN_FIND_MODE'] = old_find_mode
+        if old_find_enforce:
+            os.environ['MIOPEN_FIND_ENFORCE'] = old_find_enforce
+
         return image
     except RuntimeError as e:
         error_msg = str(e)

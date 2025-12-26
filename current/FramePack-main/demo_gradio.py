@@ -2,31 +2,48 @@ from diffusers_helper.hf_login import login
 
 import os
 import runpy
+import ctypes
 
 os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
 
 # Configure MIOpen for AMD GPUs to prevent convolution errors
 # Find mode and database configuration
-os.environ['MIOPEN_FIND_MODE'] = 'FAST'  # Fast find mode with database fallback
+# CRITICAL: Use FAST mode to prevent hanging in Find phase (VAE decoder issue)
+os.environ['MIOPEN_FIND_MODE'] = 'FAST'  # Skip exhaustive search to prevent hangs
 os.environ['MIOPEN_DEBUG_DISABLE_FIND_DB'] = '0'  # Enable find database
-os.environ['MIOPEN_FIND_ENFORCE'] = 'SEARCH'  # Always auto-tune when needed
+os.environ['MIOPEN_FIND_ENFORCE'] = 'NONE'  # Don't enforce Find if it's slow/hanging
+
+# CRITICAL: Set timeout for Find operations (prevents infinite hanging)
+os.environ['MIOPEN_FIND_TIME_LIMIT'] = '30'  # 30 second timeout for algorithm search
 
 # Critical: Enable 3D convolution algorithms (for VAE decoder)
 os.environ['MIOPEN_DEBUG_3D_CONV_IMPLICIT_GEMM_HIP_FWD_XDLOPS'] = '1'
 os.environ['MIOPEN_DEBUG_3D_CONV_IMPLICIT_GEMM_HIP_BWD_XDLOPS'] = '1'
 os.environ['MIOPEN_DEBUG_3D_CONV_IMPLICIT_GEMM_HIP_WRW_XDLOPS'] = '1'
 
-# Enable fallback mechanisms
+# Enable fallback mechanisms (CRITICAL for preventing hangs)
 os.environ['MIOPEN_DEBUG_CONV_IMMED_FALLBACK'] = '1'
 os.environ['MIOPEN_DEBUG_FORCE_IMMED_MODE_FALLBACK'] = '1'
 
-# Enable all convolution algorithm types
+# Force use of immediate mode kernels when Find times out
+os.environ['MIOPEN_DEBUG_AMD_ROCM_PRECOMPILED_BINARIES'] = '1'
+
+# Enable all convolution algorithm types including fallback algorithms
 os.environ['MIOPEN_DEBUG_CONV_IMPLICIT_GEMM'] = '1'
 os.environ['MIOPEN_DEBUG_CONV_DIRECT'] = '1'
-os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD'] = '1'  # Naive conv as robust fallback
+os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD'] = '1'  # Add naive to search space
+os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_BWD'] = '1'
+os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_WRW'] = '1'
+# Note: Naive algorithms are in the search space but MIOpen will prefer optimized ones
+# Only if optimized algorithms fail will MIOpen select naive (automatic fallback)
 
 # Logging (set to 4 for warnings, 5 for debug if issues persist)
 os.environ['MIOPEN_LOG_LEVEL'] = '4'
+
+# Trim PyTorch/HIP allocations aggressively to keep individual BlockAllocator requests small.
+# The BlockAllocator documented in cache/BlockAllocator.txt works on 2MB blocks, so we keep
+# the caching allocator from hanging onto large chunks that would otherwise fragment the pool.
+os.environ.setdefault('PYTORCH_HIP_ALLOC_CONF', 'garbage_collection_threshold:0.8,max_split_size_mb:64')
 
 # Load ZLUDA compatibility layer for AMD GPUs by default
 zluda_entry = os.path.join(os.path.dirname(__file__), 'customzluda', 'zluda-default.py')
@@ -45,6 +62,10 @@ import safetensors.torch as sf
 import numpy as np
 import argparse
 import math
+
+# Initialize MIOpen fallback system for AMD GPUs (before any torch operations)
+from diffusers_helper.miopen_fallback import initialize_miopen_fallback, MIOpenFallbackHandler
+initialize_miopen_fallback(use_monkey_patch=True, verbose=True)
 
 from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
@@ -100,7 +121,7 @@ if not high_vram:
     vae.enable_slicing()
     vae.enable_tiling()
 
-transformer.high_quality_fp32_output_for_inference = True
+transformer.high_quality_fp32_output_for_inference = False
 print('transformer.high_quality_fp32_output_for_inference = True')
 
 transformer.to(dtype=torch.bfloat16)
@@ -131,6 +152,57 @@ stream = AsyncStream()
 outputs_folder = './outputs/'
 os.makedirs(outputs_folder, exist_ok=True)
 
+IS_HIP_RUNTIME = getattr(torch.version, "hip", None) is not None
+
+
+def flush_rocm_allocator(stage: str = '', min_resident_gb: float = 0.0) -> bool:
+    """Force ROCm/HIP BlockAllocator to release cached blocks back to the driver."""
+    if not IS_HIP_RUNTIME or not torch.cuda.is_available():
+        return False
+
+    try:
+        torch.cuda.synchronize()
+    except Exception:
+        pass
+
+    torch.cuda.empty_cache()
+
+    try:
+        hip = ctypes.CDLL('libamdhip64.so')
+    except OSError as exc:
+        if stage:
+            print(f'[{stage}] HIP mempool trim skipped: {exc}')
+        return False
+
+    trim_fn = getattr(hip, 'hipMemPoolTrimTo', None)
+    get_pool_fn = getattr(hip, 'hipDeviceGetDefaultMemPool', None)
+    if trim_fn is None or get_pool_fn is None:
+        if stage:
+            print(f'[{stage}] HIP mempool trim unsupported on this runtime.')
+        return False
+
+    trim_fn.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    trim_fn.restype = ctypes.c_int
+    get_pool_fn.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int]
+    get_pool_fn.restype = ctypes.c_int
+
+    pool = ctypes.c_void_p()
+    device_index = gpu.index if isinstance(gpu, torch.device) and gpu.index is not None else torch.cuda.current_device()
+
+    status = get_pool_fn(ctypes.byref(pool), ctypes.c_int(device_index))
+    if status != 0:
+        if stage:
+            print(f'[{stage}] hipDeviceGetDefaultMemPool failed with status {status}')
+        return False
+
+    bytes_to_keep = max(0, int(min_resident_gb * (1024 ** 3)))
+    status = trim_fn(pool, ctypes.c_size_t(bytes_to_keep))
+    trimmed = status == 0
+    if stage:
+        outcome = 'trimmed' if trimmed else f'failed ({status})'
+        print(f'[{stage}] ROCm mempool {outcome}')
+    return trimmed
+
 
 @torch.no_grad()
 def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
@@ -141,12 +213,15 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
     stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
 
+    flush_rocm_allocator('worker-start')
+
     try:
         # Clean GPU
         if not high_vram:
             unload_complete_models(
                 text_encoder, text_encoder_2, image_encoder, vae, transformer
             )
+            flush_rocm_allocator('post-unload/text-enc')
 
         # Text encoding
 
@@ -165,6 +240,11 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
         llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
         llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
+
+        # Unload text encoders immediately after use (not needed anymore)
+        if not high_vram:
+            unload_complete_models(text_encoder, text_encoder_2)
+            flush_rocm_allocator('post-text-encoding')
 
         # Processing input image
 
@@ -188,6 +268,11 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
         start_latent = vae_encode(input_image_pt, vae)
 
+        # Unload VAE after encoding (will be reloaded for decoding later)
+        if not high_vram:
+            unload_complete_models(vae)
+            flush_rocm_allocator('post-vae-encoding')
+
         # CLIP Vision
 
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'CLIP Vision encoding ...'))))
@@ -197,6 +282,11 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
         image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
         image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
+
+        # Unload image encoder after use (not needed anymore)
+        if not high_vram:
+            unload_complete_models(image_encoder)
+            flush_rocm_allocator('post-clip-vision')
 
         # Dtype
 
@@ -213,7 +303,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         rnd = torch.Generator("cpu").manual_seed(seed)
         num_frames = latent_window_size * 4 - 3
 
-        history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, height // 8, width // 8), dtype=torch.float32).cpu()
+        history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, height // 8, width // 8), dtype=transformer.dtype).cpu()
         history_pixels = None
         total_generated_latent_frames = 0
 
@@ -246,6 +336,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
             if not high_vram:
                 unload_complete_models()
+                flush_rocm_allocator('post-unload/transformer')
                 # Log memory status on first iteration for debugging
                 latent_paddings_list = list(latent_paddings)
                 if latent_paddings_list and latent_padding == latent_paddings_list[0]:
@@ -313,13 +404,16 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
 
             if not high_vram:
-                # Increased from 8GB to 12GB for better compatibility with 20GB VRAM systems
-                # Allows more aggressive offloading to prevent OOM during VAE decode
-                offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=12)
+                # Completely unload transformer before loading VAE (only one model at a time)
+                # This prevents BlockAllocator failures during VAE decode
+                unload_complete_models(transformer)
+                flush_rocm_allocator('post-transformer-unload')
+
                 # Log memory before VAE load on first iteration
                 latent_paddings_list = list(latent_paddings)
                 if latent_paddings_list and latent_padding == latent_paddings_list[0]:
                     log_memory_status(gpu, prefix="[Before VAE Load] ")
+
                 load_model_as_complete(vae, target_device=gpu)
 
             real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
@@ -333,8 +427,10 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
                 history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
 
+            # Always unload models after VAE decode to free maximum VRAM
             if not high_vram:
-                unload_complete_models()
+                unload_complete_models(vae, transformer)  # Explicitly unload both VAE and transformer
+                flush_rocm_allocator('post-vae-decode')
 
             output_filename = os.path.join(outputs_folder, f'{job_id}_{total_generated_latent_frames}.mp4')
 
@@ -353,6 +449,10 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             unload_complete_models(
                 text_encoder, text_encoder_2, image_encoder, vae, transformer
             )
+            flush_rocm_allocator('exception-cleanup')
+
+    # Print MIOpen fallback statistics
+    MIOpenFallbackHandler.print_stats()
 
     stream.output_queue.push(('end', None))
     return
@@ -375,14 +475,15 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
 
         if flag == 'file':
             output_filename = data
-            yield output_filename, gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True)
+            # Force video component to update by providing explicit value
+            yield gr.update(value=output_filename), gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True)
 
         if flag == 'progress':
             preview, desc, html = data
             yield gr.update(), gr.update(visible=True, value=preview), desc, html, gr.update(interactive=False), gr.update(interactive=True)
 
         if flag == 'end':
-            yield output_filename, gr.update(visible=False), gr.update(), '', gr.update(interactive=True), gr.update(interactive=False)
+            yield gr.update(value=output_filename), gr.update(visible=False), gr.update(), '', gr.update(interactive=True), gr.update(interactive=False)
             break
 
 
@@ -426,7 +527,7 @@ with block:
                 gs = gr.Slider(label="Distilled CFG Scale", minimum=1.0, maximum=32.0, value=10.0, step=0.01, info='Changing this value is not recommended.')
                 rs = gr.Slider(label="CFG Re-Scale", minimum=0.0, maximum=1.0, value=0.0, step=0.01, visible=False)  # Should not change
 
-                gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=4, maximum=128, value=8 if not high_vram else 6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed. For 20-24GB VRAM, use 8-12GB.")
+                gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=4, maximum=128, value=18 if not high_vram else 6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed. For 20-24GB VRAM, use 18GB+ to prevent BlockAllocator failures.")
 
                 mp4_crf = gr.Slider(label="MP4 Compression", minimum=0, maximum=100, value=16, step=1, info="Lower means better quality. 0 is uncompressed. Change to 16 if you get black outputs. ")
 
