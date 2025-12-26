@@ -6,10 +6,27 @@ import runpy
 os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
 
 # Configure MIOpen for AMD GPUs to prevent convolution errors
-os.environ['MIOPEN_FIND_MODE'] = '1'  # Use find mode for algorithm selection
+# Find mode and database configuration
+os.environ['MIOPEN_FIND_MODE'] = 'FAST'  # Fast find mode with database fallback
 os.environ['MIOPEN_DEBUG_DISABLE_FIND_DB'] = '0'  # Enable find database
-os.environ['MIOPEN_FIND_ENFORCE'] = '3'  # Try all available algorithms
-os.environ['MIOPEN_LOG_LEVEL'] = '4'  # Reduce logging noise
+os.environ['MIOPEN_FIND_ENFORCE'] = 'SEARCH'  # Always auto-tune when needed
+
+# Critical: Enable 3D convolution algorithms (for VAE decoder)
+os.environ['MIOPEN_DEBUG_3D_CONV_IMPLICIT_GEMM_HIP_FWD_XDLOPS'] = '1'
+os.environ['MIOPEN_DEBUG_3D_CONV_IMPLICIT_GEMM_HIP_BWD_XDLOPS'] = '1'
+os.environ['MIOPEN_DEBUG_3D_CONV_IMPLICIT_GEMM_HIP_WRW_XDLOPS'] = '1'
+
+# Enable fallback mechanisms
+os.environ['MIOPEN_DEBUG_CONV_IMMED_FALLBACK'] = '1'
+os.environ['MIOPEN_DEBUG_FORCE_IMMED_MODE_FALLBACK'] = '1'
+
+# Enable all convolution algorithm types
+os.environ['MIOPEN_DEBUG_CONV_IMPLICIT_GEMM'] = '1'
+os.environ['MIOPEN_DEBUG_CONV_DIRECT'] = '1'
+os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD'] = '1'  # Naive conv as robust fallback
+
+# Logging (set to 4 for warnings, 5 for debug if issues persist)
+os.environ['MIOPEN_LOG_LEVEL'] = '4'
 
 # Load ZLUDA compatibility layer for AMD GPUs by default
 zluda_entry = os.path.join(os.path.dirname(__file__), 'customzluda', 'zluda-default.py')
