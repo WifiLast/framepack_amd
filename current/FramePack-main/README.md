@@ -18,89 +18,70 @@ FramePack can be trained with a much larger batch size, similar to the batch siz
 
 **Video diffusion, but feels like image diffusion.**
 
-## Table of Contents
+# News
 
-- [News](#news)
-- [Requirements](#requirements)
-- [Installation](#installation)
-- [GUI](#gui)
-- [Sanity Check](#sanity-check)
-  - [Image-to-5-seconds](#image-to-5-seconds)
-  - [Know the influence of TeaCache and Quantization](#know-the-influence-of-teacache-and-quantization)
-  - [Image-to-1-minute](#image-to-1-minute)
-- [More Examples](#more-examples)
-- [Prompting Guideline](#prompting-guideline)
-- [Cite](#cite)
+**2025 July 14:** Some pure text2video anti-drifting stress-test results of FramePack-P1 are uploaded [here,](https://lllyasviel.github.io/frame_pack_gitpage/p1/#text-to-video-stress-tests) using common prompts without any reference images.
 
-## News
+**2025 June 26:** Some results of FramePack-P1 are uploaded [here.](https://lllyasviel.github.io/frame_pack_gitpage/p1) The FramePack-P1 will be the next version of FramePack with two designs: Planned Anti-Drifting and History Discretization.
 
-- **2025 July 14:** Pure text-to-video anti-drifting stress tests for FramePack-P1 are [available here](https://lllyasviel.github.io/frame_pack_gitpage/p1/#text-to-video-stress-tests) using common prompts without reference images.
-- **2025 June 26:** Additional FramePack-P1 results are [available here](https://lllyasviel.github.io/frame_pack_gitpage/p1); this version introduces Planned Anti-Drifting and History Discretization.
-- **2025 May 03:** FramePack-F1 released. [Discuss & download here.](https://github.com/lllyasviel/FramePack/discussions/459)
+**2025 May 03:** The FramePack-F1 is released. [Try it here.](https://github.com/lllyasviel/FramePack/discussions/459)
 
-> **Important:** This repository is the *only* official FramePack source. We do not run any hosted service. External domains such as `framepack.co`, `frame_pack.co`, `framepack.net`, `framepack.ai`, `framepack.pro`, `framepack.cc`, `framepackai.co`, `framepackai.net`, `framepackai.pro`, and variants are spam. **Never pay or download anything from those sites.**
+Note that this GitHub repository is the only official FramePack website. We do not have any web services. All other websites are spam and fake, including but not limited to `framepack.co`, `frame_pack.co`, `framepack.net`, `frame_pack.net`, `framepack.ai`, `frame_pack.ai`, `framepack.pro`, `frame_pack.pro`, `framepack.cc`, `frame_pack.cc`,`framepackai.co`, `frame_pack_ai.co`, `framepackai.net`, `frame_pack_ai.net`, `framepackai.pro`, `frame_pack_ai.pro`, `framepackai.cc`, `frame_pack_ai.cc`, and so on. Again, they are all spam and fake. **Do not pay money or download files from any of those websites.**
 
-## Requirements
+# Requirements
 
 Note that this repo is a functional desktop software with minimal standalone high-quality sampling system and memory management.
 
 **Start with this repo before you try anything else!**
 
-- **GPU:** NVIDIA RTX 30/40/50 series with fp16 & bf16 support (GTX 10/20 not tested).
-- **OS:** Linux or Windows.
-- **GPU memory:** ≥ 6 GB (enough to render 60 s videos on 13B models).
-- **Storage/bandwidth:** Expect >30 GB downloads from Hugging Face on first launch.
+Requirements:
 
-To generate a 1-minute (1800 frame) video with the 13B model you still only need ~6 GB VRAM—yes, laptops work.
+* Nvidia GPU in RTX 30XX, 40XX, 50XX series that supports fp16 and bf16. The GTX 10XX/20XX are not tested.
+* Linux or Windows operating system.
+* At least 6GB GPU memory.
+
+To generate 1-minute video (60 seconds) at 30fps (1800 frames) using 13B model, the minimal required GPU memory is 6GB. (Yes 6 GB, not a typo. Laptop GPUs are okay.)
 
 About speed, on my RTX 4090 desktop it generates at a speed of 2.5 seconds/frame (unoptimized) or 1.5 seconds/frame (teacache). On my laptops like 3070ti laptop or 3060 laptop, it is about 4x to 8x slower. [Troubleshoot if your speed is much slower than this.](https://github.com/lllyasviel/FramePack/issues/151#issuecomment-2817054649)
 
 In any case, you will directly see the generated frames since it is next-frame(-section) prediction. So you will get lots of visual feedback before the entire video is generated.
 
-## Installation
+# Installation
 
-### Windows
+**Windows**:
 
-[**Download the one-click package (CUDA 12.6 + PyTorch 2.6).**](https://github.com/lllyasviel/FramePack/releases/download/windows/framepack_cu126_torch26.7z)
+[>>> Click Here to Download One-Click Package (CUDA 12.6 + Pytorch 2.6) <<<](https://github.com/lllyasviel/FramePack/releases/download/windows/framepack_cu126_torch26.7z)
 
-1. Extract the archive anywhere.
-2. Run `update.bat` once to make sure you are on the latest build.
-3. Launch `run.bat`.
+After you download, you uncompress, use `update.bat` to update, and use `run.bat` to run.
 
-> Running `update.bat` first is important; otherwise you may still be on an older build with unresolved issues.
+Note that running `update.bat` is important, otherwise you may be using a previous version with potential bugs unfixed.
 
 ![image](https://github.com/lllyasviel/stable-diffusion-webui-forge/assets/19834515/c49bd60d-82bd-4086-9859-88d472582b94)
 
 Note that the models will be downloaded automatically. You will download more than 30GB from HuggingFace.
 
-### Linux
+**Linux**:
 
 We recommend having an independent Python 3.10.
 
-```bash
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
-pip install -r requirements.txt
-```
+    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+    pip install -r requirements.txt
 
 To start the GUI, run:
 
-```bash
-python demo_gradio.py
-```
+    python demo_gradio.py
 
 Note that it supports `--share`, `--port`, `--server`, and so on.
 
 The software supports PyTorch attention, xformers, flash-attn, sage-attention. By default, it will just use PyTorch attention. You can install those attention kernels if you know how. 
 
-For example, to install sage-attention (Linux):
+For example, to install sage-attention (linux):
 
-```bash
-pip install sageattention==1.0.6
-```
+    pip install sageattention==1.0.6
 
 However, you are highly recommended to first try without sage-attention since it will influence results, though the influence is minimal.
 
-## GUI
+# GUI
 
 ![ui](https://github.com/user-attachments/assets/8c5cdbb1-b80c-4b7e-ac27-83834ac24cc4)
 
@@ -114,7 +95,7 @@ You will see the progress bar for each section and the latent preview for the ne
 
 Note that the initial progress may be slower than later diffusion as the device may need some warmup.
 
-## Sanity Check
+# Sanity Check
 
 Before trying your own inputs, we highly recommend going through the sanity check to find out if any hardware or software went wrong. 
 
@@ -278,7 +259,7 @@ If everything is in order you will get some result like this eventually.
   </tr>
 </table>
 
-## More Examples
+# More Examples
 
 Many more examples are in [**Project Page**](https://lllyasviel.github.io/frame_pack_gitpage/).
 
@@ -462,7 +443,7 @@ Below are some more examples that you may be interested in reproducing.
 
 ---
 
-## Prompting Guideline
+# Prompting Guideline
 
 Many people would ask how to write better prompts. 
 
@@ -496,7 +477,7 @@ You can also write prompts yourself. Concise prompts are usually preferred, for 
 
 and so on.
 
-## Cite
+# Cite
 
     @inproceedings{zhang2025framepack,
         title={Frame Context Packing and Drift Prevention in Next-Frame-Prediction Video Diffusion Models},

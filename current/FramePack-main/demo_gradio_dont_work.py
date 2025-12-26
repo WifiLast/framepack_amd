@@ -6,7 +6,7 @@ import runpy
 os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
 
 # Prefer AMD ROCm via custom ZLUDA shim unless explicitly disabled.
-if os.environ.get('FRAMEPACK_USE_ZLUDA', '1') not in {'0', 'false', 'False'}:
+if os.environ.get('FRAMEPACK_USE_ZLUDA', '1').lower() not in {'0', 'false'}:
     zluda_entry = os.path.join(os.path.dirname(__file__), 'customzluda', 'zluda-default.py')
     if os.path.exists(zluda_entry):
         print('Loading ZLUDA compatibility layer for ROCm/AMD GPUs...')
@@ -29,14 +29,14 @@ from transformers import LlamaModel, CLIPTextModel, LlamaTokenizerFast, CLIPToke
 from diffusers_helper.hunyuan import encode_prompt_conds, vae_decode, vae_encode, vae_decode_fake
 from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, state_dict_weighted_merge, state_dict_offset_merge, generate_timestamp
 from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
+import diffusers_helper.models.hunyuan_video_packed as hunyuan_attn
 from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
-from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete
+from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete, log_memory_status
 from diffusers_helper.thread_utils import AsyncStream, async_run
 from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_progress_bar_html
 from transformers import SiglipImageProcessor, SiglipVisionModel
 from diffusers_helper.clip_vision import hf_clip_vision_encode
 from diffusers_helper.bucket_tools import find_nearest_bucket
-import diffusers_helper.models.hunyuan_video_packed as hunyuan_attn
 
 
 parser = argparse.ArgumentParser()
@@ -68,6 +68,28 @@ text_encoder_2 = CLIPTextModel.from_pretrained("hunyuanvideo-community/HunyuanVi
 tokenizer = LlamaTokenizerFast.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer')
 tokenizer_2 = CLIPTokenizer.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer_2')
 vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='vae', torch_dtype=torch.float16).cpu()
+
+# Disable optimized attention for VAE permanently (xFormers, Flash, Sage)
+# This ensures VAE uses only default PyTorch attention
+try:
+    if hasattr(vae, 'disable_xformers_memory_efficient_attention'):
+        vae.disable_xformers_memory_efficient_attention()
+        print('VAE: Permanently disabled xFormers - using default PyTorch attention')
+
+    # Set all VAE attention modules to use standard AttnProcessor
+    from diffusers.models.attention_processor import AttnProcessor
+    vae_attn_count = 0
+    for module in vae.modules():
+        if hasattr(module, 'set_processor'):
+            try:
+                module.set_processor(AttnProcessor())
+                vae_attn_count += 1
+            except:
+                pass
+    if vae_attn_count > 0:
+        print(f'VAE: Set {vae_attn_count} attention modules to standard AttnProcessor')
+except Exception as e:
+    print(f'VAE attention setup: {e}')
 
 feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor')
 image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16).cpu()
@@ -201,7 +223,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         history_pixels = None
         total_generated_latent_frames = 0
 
-        latent_paddings = reversed(range(total_latent_sections))
+        latent_paddings = list(reversed(range(total_latent_sections)))
 
         if total_latent_sections > 4:
             # In theory the latent_paddings should follow the above sequence, but it seems that duplicating some
@@ -230,6 +252,10 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
             if not high_vram:
                 unload_complete_models()
+                # Log memory status on first iteration for debugging
+                latent_paddings_list = list(latent_paddings)
+                if latent_paddings_list and latent_padding == latent_paddings_list[0]:
+                    log_memory_status(gpu, prefix="[Before Transformer Load] ")
                 move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
 
             if use_teacache:
@@ -293,7 +319,13 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
 
             if not high_vram:
-                offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8)
+                # Increased from 8GB to 12GB for better compatibility with 20GB VRAM systems
+                # Allows more aggressive offloading to prevent OOM during VAE decode
+                offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=12)
+                # Log memory before VAE load on first iteration
+                latent_paddings_list = list(latent_paddings)
+                if latent_paddings_list and latent_padding == latent_paddings_list[0]:
+                    log_memory_status(gpu, prefix="[Before VAE Load] ")
                 load_model_as_complete(vae, target_device=gpu)
 
             real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
@@ -400,7 +432,7 @@ with block:
                 gs = gr.Slider(label="Distilled CFG Scale", minimum=1.0, maximum=32.0, value=10.0, step=0.01, info='Changing this value is not recommended.')
                 rs = gr.Slider(label="CFG Re-Scale", minimum=0.0, maximum=1.0, value=0.0, step=0.01, visible=False)  # Should not change
 
-                gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=6, maximum=128, value=6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
+                gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=4, maximum=128, value=8 if not high_vram else 6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed. For 20-24GB VRAM, use 8-12GB.")
 
                 mp4_crf = gr.Slider(label="MP4 Compression", minimum=0, maximum=100, value=16, step=1, info="Lower means better quality. 0 is uncompressed. Change to 16 if you get black outputs. ")
 

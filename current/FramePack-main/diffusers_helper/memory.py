@@ -1,6 +1,7 @@
 # By lllyasviel
 
 import time
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -267,6 +268,7 @@ def load_model_as_complete(model: torch.nn.Module, target_device: torch.device, 
     if unload:
         unload_complete_models()
 
+    # Load model to target device (native ROCm support)
     model.to(device=target_device)
     print(f'Loaded {model.__class__.__name__} to {target_device} as complete.')
 
@@ -373,6 +375,33 @@ def load_model_chunked(
     print(f'Finished loading {model.__class__.__name__}')
     gpu_complete_modules.append(model)
     torch.cuda.empty_cache()
+
+
+def log_memory_status(
+    device: Optional[torch.device] = None,
+    prefix: str = "",
+    optim_config: Optional[MemoryOptimizationConfig] = None,
+) -> None:
+    """
+    Log current memory status for the specified device.
+    """
+    target = device or gpu
+    if not torch.cuda.is_available():
+        print(f'{prefix}CUDA not available')
+        return
+
+    try:
+        free_mem = get_cuda_free_memory_gb(target, optim_config=optim_config)
+        memory_stats = torch.cuda.memory_stats(target)
+        bytes_allocated = memory_stats.get('allocated_bytes.all.current', 0)
+        bytes_reserved = memory_stats.get('reserved_bytes.all.current', 0)
+
+        allocated_gb = bytes_allocated / (1024 ** 3)
+        reserved_gb = bytes_reserved / (1024 ** 3)
+
+        print(f'{prefix}Free: {free_mem:.2f} GB | Allocated: {allocated_gb:.2f} GB | Reserved: {reserved_gb:.2f} GB')
+    except Exception as e:
+        print(f'{prefix}Error reading memory status: {e}')
 
 
 def force_free_vram(target_gb: float = 2.0, optim_config: Optional[MemoryOptimizationConfig] = None) -> float:

@@ -57,6 +57,21 @@ except:
     sageattn_varlen = None
     sageattn = None
 
+# Force disable xFormers and Flash Attention - use Sage Attention by default
+if xformers_attn_func is not None:
+    print('Disabling xFormers - will use Sage Attention if available')
+    xformers_attn_func = None
+
+if flash_attn_func is not None or flash_attn_varlen_func is not None:
+    print('Disabling Flash Attention - will use Sage Attention if available')
+    flash_attn_func = None
+    flash_attn_varlen_func = None
+
+if sageattn is not None:
+    print('Using Sage Attention as the default attention backend')
+else:
+    print('Warning: Sage Attention not available. Falling back to PyTorch scaled_dot_product_attention')
+
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 

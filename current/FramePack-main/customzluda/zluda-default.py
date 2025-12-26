@@ -273,6 +273,36 @@ zluda_device_name = torch.cuda.get_device_name() if torch.cuda.is_available() el
 is_zluda = zluda_device_name.endswith("[ZLUDA]")
 # ------------------- End Detection --------------------
 
+# ------------------- ZLUDA Cache Configuration -------------------
+if is_zluda:
+    # Configure ZLUDA cache for better performance
+    # ZLUDA translates CUDA kernels to ROCm and caches the compiled versions
+    # Setting a persistent cache directory avoids recompilation across runs
+
+    zluda_cache_dir = os.environ.get('FRAMEPACK_ZLUDA_CACHE_DIR')
+    if not zluda_cache_dir:
+        # Default to a cache directory in the project folder
+        zluda_cache_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.zluda_cache')
+
+    # Create cache directory if it doesn't exist
+    os.makedirs(zluda_cache_dir, exist_ok=True)
+
+    # Set PyTorch CUDA cache environment variables
+    # These help ZLUDA cache compiled kernels persistently
+    os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
+    # HIP/ROCm cache configuration (ZLUDA uses HIP backend)
+    os.environ.setdefault('HIP_KERNEL_CACHE_PATH', zluda_cache_dir)
+    os.environ.setdefault('HSA_ENABLE_SDMA', '0')  # Disable async DMA for stability
+
+    # ZLUDA-specific optimizations
+    # Reduce kernel recompilation by caching more aggressively
+    os.environ.setdefault('ZLUDA_KERNEL_CACHE_SIZE', '2048')  # Cache up to 2048 kernels
+
+    print(f"  ::  ZLUDA kernel cache configured at: {zluda_cache_dir}")
+    print(f"  ::  ZLUDA cache optimizations enabled")
+# ------------------- End ZLUDA Cache Configuration -------------------
+
 # ------------------- Audio Ops Patch -------------------
 if is_zluda:
     _torch_stft = torch.stft
