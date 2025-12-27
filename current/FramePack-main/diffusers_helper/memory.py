@@ -184,56 +184,6 @@ def get_cuda_free_memory_gb(
     return available_bytes / (1024 ** 3)
 
 
-def get_cuda_allocated_memory_gb(device: Optional[torch.device] = None) -> float:
-    """Get currently allocated VRAM in GB."""
-    target = device or gpu
-    if not torch.cuda.is_available():
-        return 0.0
-    memory_stats = torch.cuda.memory_stats(target)
-    bytes_allocated = memory_stats.get('allocated_bytes.all.current', 0)
-    return bytes_allocated / (1024 ** 3)
-
-
-def get_cuda_reserved_memory_gb(device: Optional[torch.device] = None) -> float:
-    """Get currently reserved VRAM in GB."""
-    target = device or gpu
-    if not torch.cuda.is_available():
-        return 0.0
-    memory_stats = torch.cuda.memory_stats(target)
-    bytes_reserved = memory_stats.get('reserved_bytes.all.current', 0)
-    return bytes_reserved / (1024 ** 3)
-
-
-# Maximum VRAM usage limit in GB (to prevent BlockAllocator failures on AMD GPUs)
-MAX_VRAM_USAGE_GB: float = 20.0  # Set to 20GB for AMD cards with 20-24GB VRAM
-
-
-def check_vram_limit(device: Optional[torch.device] = None, limit_gb: float = MAX_VRAM_USAGE_GB) -> bool:
-    """Check if current VRAM usage exceeds the limit."""
-    allocated = get_cuda_allocated_memory_gb(device)
-    if allocated > limit_gb:
-        print(f'[VRAM Limit] Warning: Allocated {allocated:.2f} GB exceeds limit of {limit_gb:.2f} GB')
-        return False
-    return True
-
-
-def log_memory_status(device: Optional[torch.device] = None, prefix: str = "") -> None:
-    """Log current VRAM usage status with optional prefix."""
-    target = device or gpu
-    if not torch.cuda.is_available():
-        print(f'{prefix}CUDA not available')
-        return
-
-    free = get_cuda_free_memory_gb(target)
-    allocated = get_cuda_allocated_memory_gb(target)
-    reserved = get_cuda_reserved_memory_gb(target)
-
-    # Calculate percentage of limit
-    percent_of_limit = (allocated / MAX_VRAM_USAGE_GB) * 100 if MAX_VRAM_USAGE_GB > 0 else 0
-
-    print(f'{prefix}Free: {free:.2f} GB | Allocated: {allocated:.2f} GB ({percent_of_limit:.1f}% of {MAX_VRAM_USAGE_GB:.0f}GB limit) | Reserved: {reserved:.2f} GB')
-
-
 def move_model_to_device_with_memory_preservation(
     model: torch.nn.Module,
     target_device: torch.device,
