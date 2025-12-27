@@ -3,6 +3,23 @@ import torch
 from diffusers.pipelines.hunyuan_video.pipeline_hunyuan_video import DEFAULT_PROMPT_TEMPLATE
 from diffusers_helper.utils import crop_or_pad_yield_mask
 
+CHANNELS_LAST_3D = getattr(torch, 'channels_last_3d', torch.contiguous_format)
+
+
+def _ensure_channels_last_3d(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor is None or tensor.dim() != 5:
+        return tensor
+    return tensor.contiguous(memory_format=CHANNELS_LAST_3D)
+
+
+def _module_device(module: torch.nn.Module) -> torch.device:
+    if hasattr(module, 'device'):
+        return module.device
+    try:
+        return next(module.parameters()).device
+    except StopIteration:
+        return torch.device('cpu')
+
 
 @torch.no_grad()
 def encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2, max_length=256):
@@ -94,122 +111,63 @@ def vae_decode_fake(latents):
 def vae_decode(latents, vae, image_mode=False):
     import sys
     import os
-    import signal
-    from contextlib import contextmanager
 
+    device = _module_device(vae)
     print(f"[VAE Decode] Starting - latents shape: {latents.shape}, device: {latents.device}", file=sys.stderr, flush=True)
-    print(f"[VAE Decode] VAE device: {vae.device}, VAE dtype: {vae.dtype}", file=sys.stderr, flush=True)
+    print(f"[VAE Decode] VAE device: {device}, VAE dtype: {vae.dtype}", file=sys.stderr, flush=True)
 
-    # Force MIOpen to use IMMEDIATE mode for VAE (prevents hanging in Find phase)
     old_find_mode = os.environ.get('MIOPEN_FIND_MODE', '')
     old_find_enforce = os.environ.get('MIOPEN_FIND_ENFORCE', '')
 
-    print(f"[VAE Decode] Setting MIOpen to IMMEDIATE mode to prevent Find phase hanging", file=sys.stderr, flush=True)
-    os.environ['MIOPEN_FIND_MODE'] = 'NORMAL'  # Use NORMAL but with immediate fallback
-    os.environ['MIOPEN_FIND_ENFORCE'] = 'NONE'  # Don't enforce Find, use immediate if Find fails
-
-    # Also ensure naive convolution is still available
+    print(f"[VAE Decode] Setting MIOPEN to IMMEDIATE mode to prevent Find phase hanging", file=sys.stderr, flush=True)
+    os.environ['MIOPEN_FIND_MODE'] = 'NORMAL'
+    os.environ['MIOPEN_FIND_ENFORCE'] = 'NONE'
     os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD'] = '1'
     os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_BWD'] = '1'
     os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_WRW'] = '1'
 
-    latents = latents / vae.config.scaling_factor
+    latents = _ensure_channels_last_3d(latents / vae.config.scaling_factor)
+    latents = latents.to(device=device, dtype=vae.dtype)
 
     try:
-        # Try GPU decode first
         if not image_mode:
-            print(f"[VAE Decode] Attempting GPU decode on {vae.device}", file=sys.stderr, flush=True)
-            torch.cuda.synchronize()  # Ensure everything is ready before decode
-            image = vae.decode(latents.to(device=vae.device, dtype=vae.dtype)).sample
-            torch.cuda.synchronize()  # Ensure decode completed
-            print(f"[VAE Decode] GPU decode SUCCESS - result device: {image.device}, shape: {image.shape}", file=sys.stderr, flush=True)
+            print(f"[VAE Decode] Attempting GPU decode on {device}", file=sys.stderr, flush=True)
+            image = vae.decode(latents).sample
         else:
-            print(f"[VAE Decode] Attempting GPU image mode decode on {vae.device}", file=sys.stderr, flush=True)
-            latents = latents.to(device=vae.device, dtype=vae.dtype).unbind(2)
-            image = [vae.decode(l.unsqueeze(2)).sample for l in latents]
+            print(f"[VAE Decode] Attempting GPU image mode decode on {device}", file=sys.stderr, flush=True)
+            latents_list = latents.unbind(2)
+            image = [vae.decode(l.unsqueeze(2)).sample for l in latents_list]
             image = torch.cat(image, dim=2)
-            torch.cuda.synchronize()  # Ensure decode completed
-            print(f"[VAE Decode] GPU image mode decode SUCCESS - result device: {image.device}, shape: {image.shape}", file=sys.stderr, flush=True)
 
-        # Restore original MIOpen settings
+        image = _ensure_channels_last_3d(image)
+        print(f"[VAE Decode] GPU decode SUCCESS - result device: {image.device}, shape: {image.shape}", file=sys.stderr, flush=True)
+        return image
+    except RuntimeError as exc:
+        print(f"[VAE Decode] GPU decode FAILED with error: {exc}", file=sys.stderr, flush=True)
+        raise
+    finally:
         if old_find_mode:
             os.environ['MIOPEN_FIND_MODE'] = old_find_mode
         if old_find_enforce:
             os.environ['MIOPEN_FIND_ENFORCE'] = old_find_enforce
 
-        return image
-    except RuntimeError as e:
-        error_msg = str(e)
-        print(f"[VAE Decode] GPU decode FAILED with error: {error_msg}", file=sys.stderr, flush=True)
-
-        # Fallback to CPU for MIOpen errors (ZLUDA 3D convolution issues)
-        if "miopenStatus" in error_msg or "MIOpen" in error_msg or "convolution" in error_msg.lower():
-            print(f"[VAE Decode] Detected MIOpen/convolution error - falling back to CPU", file=sys.stderr, flush=True)
-
-            # Move VAE to CPU
-            original_device = vae.device
-            print(f"[VAE Decode] Moving VAE from {original_device} to CPU...", file=sys.stderr, flush=True)
-            vae.to('cpu')
-            print(f"[VAE Decode] VAE moved to CPU successfully", file=sys.stderr, flush=True)
-
-            # Decode on CPU
-            if not image_mode:
-                print(f"[VAE Decode] Running CPU decode...", file=sys.stderr, flush=True)
-                image = vae.decode(latents.to(device='cpu', dtype=vae.dtype)).sample
-                print(f"[VAE Decode] CPU decode SUCCESS - result shape: {image.shape}", file=sys.stderr, flush=True)
-            else:
-                print(f"[VAE Decode] Running CPU image mode decode...", file=sys.stderr, flush=True)
-                latents = latents.to(device='cpu', dtype=vae.dtype).unbind(2)
-                image = [vae.decode(l.unsqueeze(2)).sample for l in latents]
-                image = torch.cat(image, dim=2)
-                print(f"[VAE Decode] CPU image mode decode SUCCESS - result shape: {image.shape}", file=sys.stderr, flush=True)
-
-            # Keep VAE on CPU for future operations (don't move back to avoid repeated failures)
-            print(f"[VAE Decode] Keeping VAE on CPU for future operations", file=sys.stderr, flush=True)
-            return image
-        else:
-            # Re-raise if it's a different error
-            print(f"[VAE Decode] Non-MIOpen error - re-raising exception", file=sys.stderr, flush=True)
-            raise
-
 
 @torch.no_grad()
 def vae_encode(image, vae):
     import sys
+    device = _module_device(vae)
     print(f"[VAE Encode] Starting - image shape: {image.shape}, device: {image.device}", file=sys.stderr, flush=True)
-    print(f"[VAE Encode] VAE device: {vae.device}, VAE dtype: {vae.dtype}", file=sys.stderr, flush=True)
+    print(f"[VAE Encode] VAE device: {device}, VAE dtype: {vae.dtype}", file=sys.stderr, flush=True)
+
+    image = _ensure_channels_last_3d(image)
+    image = image.to(device=device, dtype=vae.dtype)
 
     try:
-        # Try GPU encode first
-        print(f"[VAE Encode] Attempting GPU encode on {vae.device}", file=sys.stderr, flush=True)
-        latents = vae.encode(image.to(device=vae.device, dtype=vae.dtype)).latent_dist.sample()
-        latents = latents * vae.config.scaling_factor
+        print(f"[VAE Encode] Attempting GPU encode on {device}", file=sys.stderr, flush=True)
+        latents = vae.encode(image).latent_dist.sample()
+        latents = _ensure_channels_last_3d(latents * vae.config.scaling_factor)
         print(f"[VAE Encode] GPU encode SUCCESS - latents device: {latents.device}, shape: {latents.shape}", file=sys.stderr, flush=True)
         return latents
-    except RuntimeError as e:
-        error_msg = str(e)
-        print(f"[VAE Encode] GPU encode FAILED with error: {error_msg}", file=sys.stderr, flush=True)
-
-        # Fallback to CPU for MIOpen errors (ZLUDA 3D convolution issues)
-        if "miopenStatus" in error_msg or "MIOpen" in error_msg or "convolution" in error_msg.lower():
-            print(f"[VAE Encode] Detected MIOpen/convolution error - falling back to CPU", file=sys.stderr, flush=True)
-
-            # Move VAE to CPU
-            original_device = vae.device
-            print(f"[VAE Encode] Moving VAE from {original_device} to CPU...", file=sys.stderr, flush=True)
-            vae.to('cpu')
-            print(f"[VAE Encode] VAE moved to CPU successfully", file=sys.stderr, flush=True)
-
-            # Encode on CPU
-            print(f"[VAE Encode] Running CPU encode...", file=sys.stderr, flush=True)
-            latents = vae.encode(image.to(device='cpu', dtype=vae.dtype)).latent_dist.sample()
-            latents = latents * vae.config.scaling_factor
-            print(f"[VAE Encode] CPU encode SUCCESS - latents shape: {latents.shape}", file=sys.stderr, flush=True)
-
-            # Keep VAE on CPU for future operations
-            print(f"[VAE Encode] Keeping VAE on CPU for future operations", file=sys.stderr, flush=True)
-            return latents
-        else:
-            # Re-raise if it's a different error
-            print(f"[VAE Encode] Non-MIOpen error - re-raising exception", file=sys.stderr, flush=True)
-            raise
+    except RuntimeError as exc:
+        print(f"[VAE Encode] GPU encode FAILED with error: {exc}", file=sys.stderr, flush=True)
+        raise

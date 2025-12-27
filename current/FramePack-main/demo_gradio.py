@@ -3,6 +3,9 @@ from diffusers_helper.hf_login import login
 import os
 import runpy
 import ctypes
+import hashlib
+from collections import OrderedDict
+import threading
 
 os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
 
@@ -56,6 +59,7 @@ else:
 
 import gradio as gr
 import torch
+import torch.nn as nn
 import traceback
 import einops
 import safetensors.torch as sf
@@ -74,7 +78,14 @@ from diffusers_helper.hunyuan import encode_prompt_conds, vae_decode, vae_encode
 from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, state_dict_weighted_merge, state_dict_offset_merge, generate_timestamp
 from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
 from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
-from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete, log_memory_status
+from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete
+# Try to import log_memory_status (only available in AMD version)
+try:
+    from diffusers_helper.memory import log_memory_status
+except ImportError:
+    # Fallback for original CUDA version without log_memory_status
+    def log_memory_status(device=None, prefix=""):
+        pass  # No-op for compatibility
 from diffusers_helper.thread_utils import AsyncStream, async_run
 from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_progress_bar_html
 from transformers import SiglipImageProcessor, SiglipVisionModel
@@ -119,7 +130,6 @@ transformer.eval()
 
 if not high_vram:
     vae.enable_slicing()
-    vae.enable_tiling()
 
 transformer.high_quality_fp32_output_for_inference = False
 print('transformer.high_quality_fp32_output_for_inference = True')
@@ -136,6 +146,168 @@ text_encoder_2.requires_grad_(False)
 image_encoder.requires_grad_(False)
 transformer.requires_grad_(False)
 
+IS_HIP_RUNTIME = getattr(torch.version, "hip", None) is not None
+
+
+def _env_flag(name: str, default: str = '0') -> bool:
+    """Return True if the env var is a truthy value (1/true/on)."""
+    value = os.environ.get(name, default)
+    return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+USE_TORCH_COMPILE = _env_flag('FRAMEPACK_USE_TORCH_COMPILE', '1')
+TORCH_COMPILE_DYNAMIC = _env_flag('FRAMEPACK_TORCH_COMPILE_DYNAMIC', '1')
+TORCH_COMPILE_FULLGRAPH = _env_flag('FRAMEPACK_TORCH_COMPILE_FULLGRAPH', '0')
+TORCH_COMPILE_MODE = os.environ.get('FRAMEPACK_TORCH_COMPILE_MODE', 'reduce-overhead').strip()
+KEEP_VAE_FP32_NORMALIZATION = _env_flag('FRAMEPACK_VAE_FP32_NORM', '1')
+MAX_LATENT_CACHE_ITEMS = int(os.environ.get('FRAMEPACK_LATENT_CACHE_SIZE', '4'))
+ENABLE_VAE_TILING = _env_flag('FRAMEPACK_VAE_TILING', '1')
+
+
+def _torch_compile_kwargs(overrides=None):
+    kwargs = {}
+    if TORCH_COMPILE_MODE:
+        kwargs['mode'] = TORCH_COMPILE_MODE
+    if TORCH_COMPILE_DYNAMIC:
+        kwargs['dynamic'] = True
+    if TORCH_COMPILE_FULLGRAPH:
+        kwargs['fullgraph'] = True
+    if overrides:
+        kwargs.update(overrides)
+    return kwargs
+
+
+def maybe_torch_compile(module, name: str, overrides=None):
+    """Attempt to wrap a module with torch.compile if available."""
+    compile_fn = getattr(torch, 'compile', None)
+    if not USE_TORCH_COMPILE:
+        return module
+    if compile_fn is None:
+        print(f'torch.compile unavailable – skipping compilation for {name}.')
+        return module
+    try:
+        compiled_module = compile_fn(module, **_torch_compile_kwargs(overrides))
+    except Exception as exc:
+        print(f'torch.compile failed for {name}: {exc}')
+        return module
+    print(f'Enabled torch.compile for {name}.')
+    return compiled_module
+
+
+CHANNELS_LAST_3D = getattr(torch, 'channels_last_3d', torch.contiguous_format)
+_latent_cache = OrderedDict()
+_latent_cache_lock = threading.Lock()
+
+
+NORM_FP32_TYPES = (
+    nn.LayerNorm,
+    nn.GroupNorm,
+    nn.InstanceNorm1d,
+    nn.InstanceNorm2d,
+    nn.InstanceNorm3d,
+    nn.BatchNorm1d,
+    nn.BatchNorm2d,
+    nn.BatchNorm3d,
+)
+
+
+def _ensure_channels_last_3d(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor is None or tensor.dim() != 5:
+        return tensor
+    return tensor.contiguous(memory_format=CHANNELS_LAST_3D)
+
+
+def _to_gpu_channels_last(tensor: torch.Tensor, device, dtype=None):
+    if tensor is None:
+        return tensor
+    tensor = tensor.to(device=device, dtype=dtype)
+    return _ensure_channels_last_3d(tensor)
+
+
+def _prune_latent_cache():
+    while len(_latent_cache) > MAX_LATENT_CACHE_ITEMS:
+        _latent_cache.popitem(last=False)
+
+
+def get_cached_latents(key: str):
+    if not key or MAX_LATENT_CACHE_ITEMS <= 0:
+        return None
+    with _latent_cache_lock:
+        tensor = _latent_cache.get(key)
+        if tensor is None:
+            return None
+        _latent_cache.move_to_end(key)
+        return tensor.clone()
+
+
+def set_cached_latents(key: str, tensor: torch.Tensor):
+    if not key or MAX_LATENT_CACHE_ITEMS <= 0 or tensor is None:
+        return
+    with _latent_cache_lock:
+        _latent_cache[key] = tensor.detach().clone()
+        _latent_cache.move_to_end(key)
+        _prune_latent_cache()
+
+
+def image_to_cache_key(image_array: np.ndarray) -> str:
+    if image_array is None:
+        return ''
+    return hashlib.sha1(image_array.tobytes()).hexdigest()
+
+
+def _wrap_norm_module_fp32(module: torch.nn.Module):
+    if hasattr(module, '_framepack_fp32_norm'):
+        return
+
+    module.to(dtype=torch.float32)
+    original_forward = module.forward
+
+    def _forward_fp32_norm(self, *args, **kwargs):
+        if not args or not torch.is_tensor(args[0]):
+            return original_forward(*args, **kwargs)
+        input_tensor = args[0]
+        target_dtype = input_tensor.dtype
+        target_device = input_tensor.device
+
+        # Ensure module parameters are on the same device as input
+        if hasattr(self, 'weight') and self.weight is not None:
+            if self.weight.device != target_device:
+                self.to(device=target_device)
+
+        converted_args = list(args)
+        converted_args[0] = input_tensor.to(dtype=torch.float32)
+        output = original_forward(*converted_args, **kwargs)
+        if torch.is_tensor(output):
+            return output.to(dtype=target_dtype)
+        if isinstance(output, (tuple, list)):
+            converted = [o.to(dtype=target_dtype) if torch.is_tensor(o) else o for o in output]
+            return type(output)(converted)
+        return output
+
+    module.forward = _forward_fp32_norm.__get__(module, module.__class__)
+    module._framepack_fp32_norm = True
+
+
+def configure_vae_inference(vae_model: torch.nn.Module, target_device, apply_compile=True):
+    vae_model.to(device=target_device, dtype=torch.float16)
+    vae_model.to(memory_format=CHANNELS_LAST_3D)
+
+    # Apply torch.compile first if enabled
+    if apply_compile:
+        vae_model = maybe_torch_compile(vae_model, 'Autoencoder VAE', overrides={'mode': 'max-autotune'})
+
+    # Apply FP32 normalization wrapper AFTER torch.compile (or skip if torch.compile is active)
+    # This is because torch.compile creates a wrapper that makes runtime device movement impossible
+    if KEEP_VAE_FP32_NORMALIZATION and not (apply_compile and USE_TORCH_COMPILE):
+        for module in vae_model.modules():
+            if isinstance(module, NORM_FP32_TYPES):
+                _wrap_norm_module_fp32(module)
+        print("Applied FP32 normalization wrappers to VAE")
+    elif KEEP_VAE_FP32_NORMALIZATION and apply_compile and USE_TORCH_COMPILE:
+        print("Skipping FP32 normalization wrappers (incompatible with torch.compile)")
+
+    return vae_model
+
 if not high_vram:
     # DynamicSwapInstaller is same as huggingface's enable_sequential_offload but 3x faster
     DynamicSwapInstaller.install_model(transformer, device=gpu)
@@ -144,26 +316,27 @@ else:
     text_encoder.to(gpu)
     text_encoder_2.to(gpu)
     image_encoder.to(gpu)
-    vae.to(gpu)
     transformer.to(gpu)
+
+vae = configure_vae_inference(vae, target_device=gpu, apply_compile=True)
+if ENABLE_VAE_TILING:
+    vae.enable_tiling()
+
+if high_vram:
+    # torch.compile currently only makes sense when the transformer can stay resident on the GPU
+    transformer = maybe_torch_compile(transformer, 'Hunyuan Transformer')
+elif USE_TORCH_COMPILE:
+    print('Skipping torch.compile for transformer because low-VRAM swap mode is active.')
 
 stream = AsyncStream()
 
 outputs_folder = './outputs/'
 os.makedirs(outputs_folder, exist_ok=True)
 
-IS_HIP_RUNTIME = getattr(torch.version, "hip", None) is not None
-
-
 def flush_rocm_allocator(stage: str = '', min_resident_gb: float = 0.0) -> bool:
     """Force ROCm/HIP BlockAllocator to release cached blocks back to the driver."""
     if not IS_HIP_RUNTIME or not torch.cuda.is_available():
         return False
-
-    try:
-        torch.cuda.synchronize()
-    except Exception:
-        pass
 
     torch.cuda.empty_cache()
 
@@ -219,7 +392,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         # Clean GPU
         if not high_vram:
             unload_complete_models(
-                text_encoder, text_encoder_2, image_encoder, vae, transformer
+                text_encoder, text_encoder_2, image_encoder, transformer
             )
             flush_rocm_allocator('post-unload/text-enc')
 
@@ -258,20 +431,22 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
         input_image_pt = torch.from_numpy(input_image_np).float() / 127.5 - 1
         input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
+        input_image_pt = _to_gpu_channels_last(input_image_pt, gpu, dtype=vae.dtype)
+
+        image_cache_key = image_to_cache_key(input_image_np)
 
         # VAE encoding
 
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'VAE encoding ...'))))
 
-        if not high_vram:
-            load_model_as_complete(vae, target_device=gpu)
-
-        start_latent = vae_encode(input_image_pt, vae)
-
-        # Unload VAE after encoding (will be reloaded for decoding later)
-        if not high_vram:
-            unload_complete_models(vae)
-            flush_rocm_allocator('post-vae-encoding')
+        start_latent = get_cached_latents(image_cache_key)
+        if start_latent is not None:
+            start_latent = _to_gpu_channels_last(start_latent, gpu, dtype=vae.dtype)
+            print('Reusing cached VAE latents for identical input frame.')
+        else:
+            start_latent = vae_encode(input_image_pt, vae)
+            start_latent = _ensure_channels_last_3d(start_latent)
+            set_cached_latents(image_cache_key, start_latent)
 
         # CLIP Vision
 
@@ -303,7 +478,12 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         rnd = torch.Generator("cpu").manual_seed(seed)
         num_frames = latent_window_size * 4 - 3
 
-        history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, height // 8, width // 8), dtype=transformer.dtype).cpu()
+        history_latents = torch.zeros(
+            size=(1, 16, 1 + 2 + 16, height // 8, width // 8),
+            dtype=transformer.dtype,
+            device=gpu,
+        )
+        history_latents = _ensure_channels_last_3d(history_latents)
         history_pixels = None
         total_generated_latent_frames = 0
 
@@ -396,6 +576,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 clean_latent_4x_indices=clean_latent_4x_indices,
                 callback=callback,
             )
+            generated_latents = _ensure_channels_last_3d(generated_latents)
 
             if is_last_section:
                 generated_latents = torch.cat([start_latent.to(generated_latents), generated_latents], dim=2)
@@ -403,34 +584,20 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             total_generated_latent_frames += int(generated_latents.shape[2])
             history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
 
-            if not high_vram:
-                # Completely unload transformer before loading VAE (only one model at a time)
-                # This prevents BlockAllocator failures during VAE decode
-                unload_complete_models(transformer)
-                flush_rocm_allocator('post-transformer-unload')
-
-                # Log memory before VAE load on first iteration
-                latent_paddings_list = list(latent_paddings)
-                if latent_paddings_list and latent_padding == latent_paddings_list[0]:
-                    log_memory_status(gpu, prefix="[Before VAE Load] ")
-
-                load_model_as_complete(vae, target_device=gpu)
-
             real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
+            real_history_latents = _ensure_channels_last_3d(real_history_latents)
 
             if history_pixels is None:
-                history_pixels = vae_decode(real_history_latents, vae).cpu()
+                history_pixels = vae_decode(real_history_latents, vae)
+                history_pixels = _ensure_channels_last_3d(history_pixels)
             else:
                 section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
                 overlapped_frames = latent_window_size * 4 - 3
 
-                current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
+                current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae)
+                current_pixels = _ensure_channels_last_3d(current_pixels)
                 history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
-
-            # Always unload models after VAE decode to free maximum VRAM
-            if not high_vram:
-                unload_complete_models(vae, transformer)  # Explicitly unload both VAE and transformer
-                flush_rocm_allocator('post-vae-decode')
+                history_pixels = _ensure_channels_last_3d(history_pixels)
 
             output_filename = os.path.join(outputs_folder, f'{job_id}_{total_generated_latent_frames}.mp4')
 
@@ -447,7 +614,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
         if not high_vram:
             unload_complete_models(
-                text_encoder, text_encoder_2, image_encoder, vae, transformer
+                text_encoder, text_encoder_2, image_encoder, transformer
             )
             flush_rocm_allocator('exception-cleanup')
 
