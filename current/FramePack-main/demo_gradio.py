@@ -162,6 +162,9 @@ TORCH_COMPILE_MODE = os.environ.get('FRAMEPACK_TORCH_COMPILE_MODE', 'reduce-over
 KEEP_VAE_FP32_NORMALIZATION = _env_flag('FRAMEPACK_VAE_FP32_NORM', '1')
 MAX_LATENT_CACHE_ITEMS = int(os.environ.get('FRAMEPACK_LATENT_CACHE_SIZE', '4'))
 ENABLE_VAE_TILING = _env_flag('FRAMEPACK_VAE_TILING', '1')
+VAE_TILE_SAMPLE_MIN = int(os.environ.get('FRAMEPACK_VAE_TILE_SAMPLE', '256'))
+VAE_TILE_LATENT_MIN = int(os.environ.get('FRAMEPACK_VAE_TILE_LATENT', '64'))
+VAE_DECODE_CHUNK = int(os.environ.get('FRAMEPACK_VAE_DECODE_CHUNK', '4'))
 
 
 def _torch_compile_kwargs(overrides=None):
@@ -255,6 +258,49 @@ def image_to_cache_key(image_array: np.ndarray) -> str:
     return hashlib.sha1(image_array.tobytes()).hexdigest()
 
 
+def _configure_vae_tiling(vae_model: torch.nn.Module):
+    if not ENABLE_VAE_TILING:
+        return vae_model
+
+    enable_fn = getattr(vae_model, 'enable_tiling', None)
+    if enable_fn is None:
+        print('VAE tiling requested but not supported by this model.')
+        return vae_model
+
+    kwargs = {
+        'tile_sample_min_height': VAE_TILE_SAMPLE_MIN,
+        'tile_sample_min_width': VAE_TILE_SAMPLE_MIN,
+        'tile_latent_min_height': VAE_TILE_LATENT_MIN,
+        'tile_latent_min_width': VAE_TILE_LATENT_MIN,
+    }
+
+    try:
+        enable_fn(**kwargs)
+    except TypeError:
+        # Older versions don't accept tiling kwargs; call without them and set attributes manually
+        enable_fn()
+        for attr, value in kwargs.items():
+            if hasattr(vae_model, attr):
+                setattr(vae_model, attr, value)
+    print(f'Enabled VAE tiling with sample_min={VAE_TILE_SAMPLE_MIN}, latent_min={VAE_TILE_LATENT_MIN}')
+    return vae_model
+
+
+def decode_latents_with_chunks(latents: torch.Tensor, vae_model: torch.nn.Module, chunk_size: int = VAE_DECODE_CHUNK):
+    chunk_size = max(int(chunk_size) if chunk_size else 0, 0)
+    if chunk_size <= 0 or latents.shape[2] <= chunk_size:
+        return vae_decode(latents, vae_model)
+
+    decoded_chunks = []
+    total = latents.shape[2]
+    for start in range(0, total, chunk_size):
+        end = min(start + chunk_size, total)
+        chunk = latents[:, :, start:end, :, :]
+        decoded = vae_decode(chunk, vae_model)
+        decoded_chunks.append(decoded)
+    return torch.cat(decoded_chunks, dim=2)
+
+
 def _wrap_norm_module_fp32(module: torch.nn.Module):
     if hasattr(module, '_framepack_fp32_norm'):
         return
@@ -291,6 +337,7 @@ def _wrap_norm_module_fp32(module: torch.nn.Module):
 def configure_vae_inference(vae_model: torch.nn.Module, target_device, apply_compile=True):
     vae_model.to(device=target_device, dtype=torch.float16)
     vae_model.to(memory_format=CHANNELS_LAST_3D)
+    _configure_vae_tiling(vae_model)
 
     # Apply torch.compile first if enabled
     if apply_compile:
@@ -319,8 +366,6 @@ else:
     transformer.to(gpu)
 
 vae = configure_vae_inference(vae, target_device=gpu, apply_compile=True)
-if ENABLE_VAE_TILING:
-    vae.enable_tiling()
 
 if high_vram:
     # torch.compile currently only makes sense when the transformer can stay resident on the GPU
@@ -588,13 +633,14 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             real_history_latents = _ensure_channels_last_3d(real_history_latents)
 
             if history_pixels is None:
-                history_pixels = vae_decode(real_history_latents, vae)
+                history_pixels = decode_latents_with_chunks(real_history_latents, vae)
                 history_pixels = _ensure_channels_last_3d(history_pixels)
             else:
                 section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
                 overlapped_frames = latent_window_size * 4 - 3
 
-                current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae)
+                section_latents = real_history_latents[:, :, :section_latent_frames]
+                current_pixels = decode_latents_with_chunks(section_latents, vae)
                 current_pixels = _ensure_channels_last_3d(current_pixels)
                 history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
                 history_pixels = _ensure_channels_last_3d(history_pixels)
