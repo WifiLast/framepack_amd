@@ -66,6 +66,17 @@ HSA exception: MemoryRegion::BlockAllocator::alloc failed
 
 ---
 
+#### 5. Video Extension Is Very Slow
+**Symptoms:**
+- Message: "The video is being extended now..."
+- Generation appears to slow down significantly
+- Console shows transformer being reloaded repeatedly
+- Each video section takes 16-47 seconds overhead
+
+**This is EXPECTED behavior** - See **[VIDEO_EXTENSION_SLOWDOWN_EXPLANATION.md](VIDEO_EXTENSION_SLOWDOWN_EXPLANATION.md)**
+
+---
+
 ## Documentation Files
 
 ### Core Documentation
