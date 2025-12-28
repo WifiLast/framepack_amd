@@ -123,8 +123,8 @@ def vae_decode(latents, vae, image_mode=False):
     os.environ['MIOPEN_FIND_MODE'] = 'NORMAL'
     os.environ['MIOPEN_FIND_ENFORCE'] = 'NONE'
     os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD'] = '1'
-    os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_BWD'] = '1'
-    os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_WRW'] = '1'
+    os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_BWD'] = '0'
+    os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_WRW'] = '0'
 
     latents = _ensure_channels_last_3d(latents / vae.config.scaling_factor)
     latents = latents.to(device=device, dtype=vae.dtype)

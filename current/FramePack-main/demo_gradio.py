@@ -35,8 +35,8 @@ os.environ['MIOPEN_DEBUG_AMD_ROCM_PRECOMPILED_BINARIES'] = '1'
 os.environ['MIOPEN_DEBUG_CONV_IMPLICIT_GEMM'] = '1'
 os.environ['MIOPEN_DEBUG_CONV_DIRECT'] = '1'
 os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD'] = '1'  # Add naive to search space
-os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_BWD'] = '1'
-os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_WRW'] = '1'
+os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_BWD'] = '0'
+os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_WRW'] = '0'
 # Note: Naive algorithms are in the search space but MIOpen will prefer optimized ones
 # Only if optimized algorithms fail will MIOpen select naive (automatic fallback)
 
@@ -589,13 +589,13 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
             if history_pixels is None:
                 history_pixels = vae_decode(real_history_latents, vae)
-                history_pixels = _ensure_channels_last_3d(history_pixels)
+                history_pixels = _ensure_channels_last_3d(history_pixels).cpu()
             else:
                 section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
                 overlapped_frames = latent_window_size * 4 - 3
 
                 current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae)
-                current_pixels = _ensure_channels_last_3d(current_pixels)
+                current_pixels = _ensure_channels_last_3d(current_pixels).cpu()
                 history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
                 history_pixels = _ensure_channels_last_3d(history_pixels)
 
