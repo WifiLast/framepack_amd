@@ -3,23 +3,6 @@ import torch
 from diffusers.pipelines.hunyuan_video.pipeline_hunyuan_video import DEFAULT_PROMPT_TEMPLATE
 from diffusers_helper.utils import crop_or_pad_yield_mask
 
-CHANNELS_LAST_3D = getattr(torch, 'channels_last_3d', torch.contiguous_format)
-
-
-def _ensure_channels_last_3d(tensor: torch.Tensor) -> torch.Tensor:
-    if tensor is None or tensor.dim() != 5:
-        return tensor
-    return tensor.contiguous(memory_format=CHANNELS_LAST_3D)
-
-
-def _module_device(module: torch.nn.Module) -> torch.device:
-    if hasattr(module, 'device'):
-        return module.device
-    try:
-        return next(module.parameters()).device
-    except StopIteration:
-        return torch.device('cpu')
-
 
 @torch.no_grad()
 def encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2, max_length=256):
@@ -109,65 +92,20 @@ def vae_decode_fake(latents):
 
 @torch.no_grad()
 def vae_decode(latents, vae, image_mode=False):
-    import sys
-    import os
+    latents = latents / vae.config.scaling_factor
 
-    device = _module_device(vae)
-    print(f"[VAE Decode] Starting - latents shape: {latents.shape}, device: {latents.device}", file=sys.stderr, flush=True)
-    print(f"[VAE Decode] VAE device: {device}, VAE dtype: {vae.dtype}", file=sys.stderr, flush=True)
+    if not image_mode:
+        image = vae.decode(latents.to(device=vae.device, dtype=vae.dtype)).sample
+    else:
+        latents = latents.to(device=vae.device, dtype=vae.dtype).unbind(2)
+        image = [vae.decode(l.unsqueeze(2)).sample for l in latents]
+        image = torch.cat(image, dim=2)
 
-    old_find_mode = os.environ.get('MIOPEN_FIND_MODE', '')
-    old_find_enforce = os.environ.get('MIOPEN_FIND_ENFORCE', '')
-
-    print(f"[VAE Decode] Setting MIOPEN to IMMEDIATE mode to prevent Find phase hanging", file=sys.stderr, flush=True)
-    os.environ['MIOPEN_FIND_MODE'] = 'NORMAL'
-    os.environ['MIOPEN_FIND_ENFORCE'] = 'NONE'
-    os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD'] = '1'
-    os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_BWD'] = '1'
-    os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_WRW'] = '1'
-
-    latents = _ensure_channels_last_3d(latents / vae.config.scaling_factor)
-    latents = latents.to(device=device, dtype=vae.dtype)
-
-    try:
-        if not image_mode:
-            print(f"[VAE Decode] Attempting GPU decode on {device}", file=sys.stderr, flush=True)
-            image = vae.decode(latents).sample
-        else:
-            print(f"[VAE Decode] Attempting GPU image mode decode on {device}", file=sys.stderr, flush=True)
-            latents_list = latents.unbind(2)
-            image = [vae.decode(l.unsqueeze(2)).sample for l in latents_list]
-            image = torch.cat(image, dim=2)
-
-        image = _ensure_channels_last_3d(image)
-        print(f"[VAE Decode] GPU decode SUCCESS - result device: {image.device}, shape: {image.shape}", file=sys.stderr, flush=True)
-        return image
-    except RuntimeError as exc:
-        print(f"[VAE Decode] GPU decode FAILED with error: {exc}", file=sys.stderr, flush=True)
-        raise
-    finally:
-        if old_find_mode:
-            os.environ['MIOPEN_FIND_MODE'] = old_find_mode
-        if old_find_enforce:
-            os.environ['MIOPEN_FIND_ENFORCE'] = old_find_enforce
+    return image
 
 
 @torch.no_grad()
 def vae_encode(image, vae):
-    import sys
-    device = _module_device(vae)
-    print(f"[VAE Encode] Starting - image shape: {image.shape}, device: {image.device}", file=sys.stderr, flush=True)
-    print(f"[VAE Encode] VAE device: {device}, VAE dtype: {vae.dtype}", file=sys.stderr, flush=True)
-
-    image = _ensure_channels_last_3d(image)
-    image = image.to(device=device, dtype=vae.dtype)
-
-    try:
-        print(f"[VAE Encode] Attempting GPU encode on {device}", file=sys.stderr, flush=True)
-        latents = vae.encode(image).latent_dist.sample()
-        latents = _ensure_channels_last_3d(latents * vae.config.scaling_factor)
-        print(f"[VAE Encode] GPU encode SUCCESS - latents device: {latents.device}, shape: {latents.shape}", file=sys.stderr, flush=True)
-        return latents
-    except RuntimeError as exc:
-        print(f"[VAE Encode] GPU encode FAILED with error: {exc}", file=sys.stderr, flush=True)
-        raise
+    latents = vae.encode(image.to(device=vae.device, dtype=vae.dtype)).latent_dist.sample()
+    latents = latents * vae.config.scaling_factor
+    return latents

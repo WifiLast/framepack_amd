@@ -6,6 +6,7 @@ import ctypes
 import hashlib
 from collections import OrderedDict
 import threading
+from contextlib import nullcontext
 
 os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
 
@@ -34,9 +35,9 @@ os.environ['MIOPEN_DEBUG_AMD_ROCM_PRECOMPILED_BINARIES'] = '1'
 # Enable all convolution algorithm types including fallback algorithms
 os.environ['MIOPEN_DEBUG_CONV_IMPLICIT_GEMM'] = '1'
 os.environ['MIOPEN_DEBUG_CONV_DIRECT'] = '1'
-os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD'] = '1'  # Add naive to search space
-os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_BWD'] = '1'
-os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_WRW'] = '1'
+os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD'] = '0'  # Add naive to search space
+os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_BWD'] = '0'
+os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_WRW'] = '0'
 # Note: Naive algorithms are in the search space but MIOpen will prefer optimized ones
 # Only if optimized algorithms fail will MIOpen select naive (automatic fallback)
 
@@ -79,13 +80,33 @@ from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, so
 from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
 from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
 from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete
-# Try to import log_memory_status (only available in AMD version)
+
+# Try to import optional functions (only available in AMD version)
 try:
     from diffusers_helper.memory import log_memory_status
 except ImportError:
     # Fallback for original CUDA version without log_memory_status
     def log_memory_status(device=None, prefix=""):
         pass  # No-op for compatibility
+
+try:
+    from diffusers_helper.memory import temporary_model_on_device
+except ImportError:
+    # Fallback for original CUDA version without temporary_model_on_device
+    from contextlib import contextmanager
+    @contextmanager
+    def temporary_model_on_device(model, target_device, preserved_memory_gb=0):
+        """Simple fallback that just moves model to device and back"""
+        try:
+            original_device = next(model.parameters()).device
+        except (StopIteration, AttributeError):
+            original_device = cpu
+        try:
+            model.to(target_device)
+            yield model
+        finally:
+            model.to(original_device)
+            torch.cuda.empty_cache()
 from diffusers_helper.thread_utils import AsyncStream, async_run
 from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_progress_bar_html
 from transformers import SiglipImageProcessor, SiglipVisionModel
@@ -286,19 +307,27 @@ def _configure_vae_tiling(vae_model: torch.nn.Module):
     return vae_model
 
 
-def decode_latents_with_chunks(latents: torch.Tensor, vae_model: torch.nn.Module, chunk_size: int = VAE_DECODE_CHUNK):
+def decode_latents_with_chunks(
+    latents: torch.Tensor,
+    vae_model: torch.nn.Module,
+    chunk_size: int = VAE_DECODE_CHUNK,
+    device_context_factory=None,
+):
     chunk_size = max(int(chunk_size) if chunk_size else 0, 0)
-    if chunk_size <= 0 or latents.shape[2] <= chunk_size:
-        return vae_decode(latents, vae_model)
+    context_factory = device_context_factory or (lambda: nullcontext(vae_model))
 
-    decoded_chunks = []
-    total = latents.shape[2]
-    for start in range(0, total, chunk_size):
-        end = min(start + chunk_size, total)
-        chunk = latents[:, :, start:end, :, :]
-        decoded = vae_decode(chunk, vae_model)
-        decoded_chunks.append(decoded)
-    return torch.cat(decoded_chunks, dim=2)
+    with context_factory() as active_vae:
+        if chunk_size <= 0 or latents.shape[2] <= chunk_size:
+            return vae_decode(latents, active_vae)
+
+        decoded_chunks = []
+        total = latents.shape[2]
+        for start in range(0, total, chunk_size):
+            end = min(start + chunk_size, total)
+            chunk = latents[:, :, start:end, :, :]
+            decoded = vae_decode(chunk, active_vae)
+            decoded_chunks.append(decoded)
+        return torch.cat(decoded_chunks, dim=2)
 
 
 def _wrap_norm_module_fp32(module: torch.nn.Module):
@@ -365,7 +394,10 @@ else:
     image_encoder.to(gpu)
     transformer.to(gpu)
 
-vae = configure_vae_inference(vae, target_device=gpu, apply_compile=True)
+vae = configure_vae_inference(vae, target_device=(gpu if high_vram else cpu), apply_compile=high_vram)
+
+if not high_vram:
+    vae.to(device=cpu)
 
 if high_vram:
     # torch.compile currently only makes sense when the transformer can stay resident on the GPU
@@ -441,6 +473,17 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             )
             flush_rocm_allocator('post-unload/text-enc')
 
+        if high_vram:
+            def vae_device_context():
+                return nullcontext(vae)
+        else:
+            def vae_device_context():
+                return temporary_model_on_device(
+                    vae,
+                    target_device=gpu,
+                    preserved_memory_gb=gpu_memory_preservation,
+                )
+
         # Text encoding
 
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Text encoding ...'))))
@@ -489,7 +532,8 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             start_latent = _to_gpu_channels_last(start_latent, gpu, dtype=vae.dtype)
             print('Reusing cached VAE latents for identical input frame.')
         else:
-            start_latent = vae_encode(input_image_pt, vae)
+            with vae_device_context() as active_vae:
+                start_latent = vae_encode(input_image_pt, active_vae)
             start_latent = _ensure_channels_last_3d(start_latent)
             set_cached_latents(image_cache_key, start_latent)
 
@@ -633,15 +677,23 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             real_history_latents = _ensure_channels_last_3d(real_history_latents)
 
             if history_pixels is None:
-                history_pixels = decode_latents_with_chunks(real_history_latents, vae)
-                history_pixels = _ensure_channels_last_3d(history_pixels)
+                history_pixels = decode_latents_with_chunks(
+                    real_history_latents,
+                    vae,
+                    device_context_factory=vae_device_context,
+                )
+                history_pixels = _ensure_channels_last_3d(history_pixels).to(cpu)
             else:
                 section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
                 overlapped_frames = latent_window_size * 4 - 3
 
                 section_latents = real_history_latents[:, :, :section_latent_frames]
-                current_pixels = decode_latents_with_chunks(section_latents, vae)
-                current_pixels = _ensure_channels_last_3d(current_pixels)
+                current_pixels = decode_latents_with_chunks(
+                    section_latents,
+                    vae,
+                    device_context_factory=vae_device_context,
+                )
+                current_pixels = _ensure_channels_last_3d(current_pixels).to(cpu)
                 history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
                 history_pixels = _ensure_channels_last_3d(history_pixels)
 

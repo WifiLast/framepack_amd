@@ -395,3 +395,44 @@ def force_free_vram(target_gb: float = 2.0, optim_config: Optional[MemoryOptimiz
         print(f'Warning: Only {free_mem:.2f} GB available, requested {target_gb} GB')
 
     return free_mem
+
+
+def temporary_model_on_device(
+    model: torch.nn.Module,
+    target_device: torch.device,
+    preserved_memory_gb: float = 0,
+):
+    """
+    Context manager that temporarily moves a model to a device and back.
+    Uses memory preservation to avoid OOM errors.
+
+    Usage:
+        with temporary_model_on_device(vae, gpu, preserved_memory_gb=18) as active_vae:
+            output = active_vae.encode(input)
+    """
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _context():
+        # Get original device
+        try:
+            original_device = next(model.parameters()).device
+        except StopIteration:
+            original_device = cpu
+
+        # Move to target device
+        if preserved_memory_gb > 0:
+            move_model_to_device_with_memory_preservation(
+                model, target_device, preserved_memory_gb=preserved_memory_gb
+            )
+        else:
+            model.to(target_device)
+
+        try:
+            yield model
+        finally:
+            # Move back to original device
+            model.to(original_device)
+            torch.cuda.empty_cache()
+
+    return _context()
