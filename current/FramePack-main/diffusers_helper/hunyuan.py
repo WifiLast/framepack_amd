@@ -122,7 +122,7 @@ def vae_decode(latents, vae, image_mode=False):
     print(f"[VAE Decode] Setting MIOPEN to IMMEDIATE mode to prevent Find phase hanging", file=sys.stderr, flush=True)
     os.environ['MIOPEN_FIND_MODE'] = 'NORMAL'
     os.environ['MIOPEN_FIND_ENFORCE'] = 'NONE'
-    os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD'] = '1'
+    os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD'] = '0'
     os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_BWD'] = '0'
     os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_WRW'] = '0'
 

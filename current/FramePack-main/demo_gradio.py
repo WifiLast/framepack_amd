@@ -9,6 +9,13 @@ import threading
 
 os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
 
+# Separate cache directories for AMD ROCm to prevent CUDA/ROCm interference
+_cache_base = os.path.join(os.path.dirname(__file__), '.cache_rocm')
+os.makedirs(_cache_base, exist_ok=True)
+os.environ['TRITON_CACHE_DIR'] = os.path.join(_cache_base, 'triton')
+os.environ['TORCH_EXTENSIONS_DIR'] = os.path.join(_cache_base, 'torch_extensions')
+os.environ['TORCHINDUCTOR_CACHE_DIR'] = os.path.join(_cache_base, 'inductor')
+
 # Configure MIOpen for AMD GPUs to prevent convolution errors
 # Find mode and database configuration
 # CRITICAL: Use FAST mode to prevent hanging in Find phase (VAE decoder issue)
@@ -34,7 +41,7 @@ os.environ['MIOPEN_DEBUG_AMD_ROCM_PRECOMPILED_BINARIES'] = '1'
 # Enable all convolution algorithm types including fallback algorithms
 os.environ['MIOPEN_DEBUG_CONV_IMPLICIT_GEMM'] = '1'
 os.environ['MIOPEN_DEBUG_CONV_DIRECT'] = '1'
-os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD'] = '1'  # Add naive to search space
+os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD'] = '0'  # Add naive to search space
 os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_BWD'] = '0'
 os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_WRW'] = '0'
 # Note: Naive algorithms are in the search space but MIOpen will prefer optimized ones
@@ -758,7 +765,7 @@ with block:
                 gs = gr.Slider(label="Distilled CFG Scale", minimum=1.0, maximum=32.0, value=10.0, step=0.01, info='Changing this value is not recommended.')
                 rs = gr.Slider(label="CFG Re-Scale", minimum=0.0, maximum=1.0, value=0.0, step=0.01, visible=False)  # Should not change
 
-                gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=4, maximum=128, value=18 if not high_vram else 6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed. For 20-24GB VRAM, use 18GB+ to prevent BlockAllocator failures.")
+                gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=4, maximum=128, value=10 if not high_vram else 6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed. For 20-24GB VRAM, use 10GB+ to prevent BlockAllocator failures.")
 
                 mp4_crf = gr.Slider(label="MP4 Compression", minimum=0, maximum=100, value=16, step=1, info="Lower means better quality. 0 is uncompressed. Change to 16 if you get black outputs. ")
 
