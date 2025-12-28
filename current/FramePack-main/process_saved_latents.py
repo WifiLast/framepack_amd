@@ -20,16 +20,28 @@ def _ensure_channels_last_3d(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.contiguous(memory_format=CHANNELS_LAST_3D)
 
 
-def load_vae(device: torch.device) -> AutoencoderKLHunyuanVideo:
+def load_vae(device: torch.device, enable_tiling: bool = True, enable_slicing: bool = False) -> AutoencoderKLHunyuanVideo:
+    """Load VAE model optimized for GPU inference."""
+    print(f'Loading VAE on {device}...')
     vae = AutoencoderKLHunyuanVideo.from_pretrained(
         "hunyuanvideo-community/HunyuanVideo",
         subfolder='vae',
         torch_dtype=torch.float16,
     )
     vae.to(device=device, dtype=torch.float16)
-    if hasattr(vae, 'enable_tiling'):
+    vae.to(memory_format=CHANNELS_LAST_3D)
+
+    if enable_tiling and hasattr(vae, 'enable_tiling'):
         vae.enable_tiling()
+        print('VAE tiling enabled')
+
+    if enable_slicing and hasattr(vae, 'enable_slicing'):
+        vae.enable_slicing()
+        print('VAE slicing enabled (for lower VRAM usage)')
+
     vae.eval()
+    vae.requires_grad_(False)
+    print(f'VAE loaded successfully')
     return vae
 
 
@@ -39,7 +51,21 @@ def reconstruct_video_from_segments(
     metadata: Dict[str, int],
     vae: AutoencoderKLHunyuanVideo,
     output_path: str,
+    verbose: bool = True,
 ) -> str:
+    """
+    Reconstruct video from latent segments using GPU-accelerated VAE decoding.
+
+    Args:
+        segments: List of latent segments from the saved file
+        metadata: Metadata dictionary with video parameters
+        vae: VAE model already loaded on GPU
+        output_path: Path to save the output video
+        verbose: Whether to print progress information
+
+    Returns:
+        Path to the saved video file
+    """
     if not segments:
         raise ValueError('No latent segments found in the provided file.')
 
@@ -48,6 +74,15 @@ def reconstruct_video_from_segments(
     width = int(metadata.get('width'))
     fps = int(metadata.get('fps', 30))
     mp4_crf = int(metadata.get('mp4_crf', 16))
+    total_segments = len(segments)
+
+    if verbose:
+        print(f'\nReconstruction Info:')
+        print(f'  Total segments: {total_segments}')
+        print(f'  Resolution: {width}x{height}')
+        print(f'  FPS: {fps}')
+        print(f'  Latent window size: {latent_window_size}')
+        print(f'  Output: {output_path}\n')
 
     base_dtype = segments[0]['generated_latents'].dtype
     device = next(vae.parameters()).device
@@ -63,8 +98,11 @@ def reconstruct_video_from_segments(
     total_generated_latent_frames = 0
     overlap_frames = latent_window_size * 4 - 3
 
-    for segment in segments:
-        generated_latents = segment['generated_latents'].to(device)
+    for idx, segment in enumerate(segments, 1):
+        if verbose:
+            print(f'Processing segment {idx}/{total_segments}...')
+
+        generated_latents = segment['generated_latents'].to(device=device, dtype=base_dtype)
         generated_latents = _ensure_channels_last_3d(generated_latents)
         total_generated_latent_frames += int(generated_latents.shape[2])
         history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
@@ -72,35 +110,84 @@ def reconstruct_video_from_segments(
         real_history_latents = _ensure_channels_last_3d(real_history_latents)
 
         if history_pixels is None:
+            if verbose:
+                print(f'  Decoding initial segment (latent frames: {real_history_latents.shape[2]})...')
             decoded = vae_decode(real_history_latents, vae)
             history_pixels = _ensure_channels_last_3d(decoded).cpu()
         else:
             is_last_section = bool(segment.get('is_last_section'))
             section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
             current_latents = real_history_latents[:, :, :section_latent_frames, :, :]
+            if verbose:
+                print(f'  Decoding segment (latent frames: {current_latents.shape[2]}, last={is_last_section})...')
             decoded = vae_decode(current_latents, vae)
             decoded = _ensure_channels_last_3d(decoded).cpu()
             history_pixels = soft_append_bcthw(decoded, history_pixels, overlap_frames)
             history_pixels = _ensure_channels_last_3d(history_pixels)
 
+        # Clear GPU cache periodically
+        if idx % 2 == 0:
+            torch.cuda.empty_cache()
+
+    total_frames = history_pixels.shape[2]
+    duration = total_frames / fps
+    if verbose:
+        print(f'\nDecoding complete!')
+        print(f'  Total frames: {total_frames}')
+        print(f'  Duration: {duration:.2f} seconds')
+        print(f'  Saving video to {output_path}...')
+
     save_bcthw_as_mp4(history_pixels, output_path, fps=fps, crf=mp4_crf)
+
+    if verbose:
+        print(f'Video saved successfully!')
+
     return output_path
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description='Resume video generation from saved FramePack latents.')
+    parser = argparse.ArgumentParser(
+        description='Resume video generation from saved FramePack latents.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+  # Process on NVIDIA GPU (default)
+  python process_saved_latents.py --latents outputs/20250101_123456_latents.pt
+
+  # Process on specific GPU with custom output
+  python process_saved_latents.py --latents outputs/20250101_123456_latents.pt --device cuda:1 --output my_video.mp4
+
+  # Process on CPU (slow, for testing)
+  python process_saved_latents.py --latents outputs/20250101_123456_latents.pt --device cpu
+
+  # Enable slicing for lower VRAM usage
+  python process_saved_latents.py --latents outputs/20250101_123456_latents.pt --enable-slicing
+        '''
+    )
     parser.add_argument('--latents', required=True, help='Path to the saved *_latents.pt file.')
-    parser.add_argument('--device', default='cuda:0', help='Device for VAE decoding (e.g., cuda:0 or cpu).')
-    parser.add_argument('--output-dir', default='./outputs', help='Directory for the reconstructed video output.')
+    parser.add_argument('--device', default='cuda:0', help='Device for VAE decoding (e.g., cuda:0, cuda:1, or cpu). Default: cuda:0')
+    parser.add_argument('--output-dir', default='./outputs', help='Directory for the reconstructed video output. Default: ./outputs')
     parser.add_argument('--output', default=None, help='Optional filename for the output video (defaults to <job_id>_resume.mp4).')
+    parser.add_argument('--enable-slicing', action='store_true', help='Enable VAE slicing for lower VRAM usage (slower but uses less memory).')
+    parser.add_argument('--disable-tiling', action='store_true', help='Disable VAE tiling (not recommended, may cause OOM).')
+    parser.add_argument('--quiet', action='store_true', help='Suppress progress output.')
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
+    print(f'Loading latent file: {args.latents}')
     latents_pkg = torch.load(args.latents, map_location='cpu')
     metadata = latents_pkg.get('metadata', {})
     segments = latents_pkg.get('segments', [])
+
+    if not segments:
+        print('Error: No segments found in latent file!')
+        return
+
+    version = metadata.get('version', 0)
+    print(f'Latent file version: {version}')
 
     os.makedirs(args.output_dir, exist_ok=True)
     job_id = metadata.get('job_id', 'framepack')
@@ -108,10 +195,18 @@ def main() -> None:
     output_path = os.path.join(args.output_dir, output_name)
 
     device = torch.device(args.device)
-    vae = load_vae(device)
+    print(f'Using device: {device}')
 
-    reconstructed_path = reconstruct_video_from_segments(segments, metadata, vae, output_path)
-    print(f'Reconstructed video saved to {reconstructed_path}')
+    if device.type == 'cuda' and not torch.cuda.is_available():
+        print('Error: CUDA requested but not available! Falling back to CPU.')
+        device = torch.device('cpu')
+
+    vae = load_vae(device, enable_tiling=not args.disable_tiling, enable_slicing=args.enable_slicing)
+
+    reconstructed_path = reconstruct_video_from_segments(
+        segments, metadata, vae, output_path, verbose=not args.quiet
+    )
+    print(f'\n✓ Reconstructed video saved to: {reconstructed_path}')
 
 
 if __name__ == '__main__':

@@ -276,7 +276,50 @@ def save_bcthw_as_mp4(x, output_filename, fps=10, crf=0):
     x = torch.clamp(x.float(), -1., 1.) * 127.5 + 127.5
     x = x.detach().cpu().to(torch.uint8)
     x = einops.rearrange(x, '(m n) c t h w -> t (m h) (n w) c', n=per_row)
-    torchvision.io.write_video(output_filename, x, fps=fps, video_codec='libx264', options={'crf': str(int(crf))})
+
+    # Monkey-patch torchvision for PyAV compatibility
+    # Newer PyAV versions changed pict_type to require integers instead of strings
+    original_write = torchvision.io.write_video
+    def patched_write_video(filename, video_array, fps, video_codec='libx264', options=None, audio_array=None, audio_fps=None, audio_codec=None, audio_options=None):
+        try:
+            return original_write(filename, video_array, fps, video_codec, options, audio_array, audio_fps, audio_codec, audio_options)
+        except TypeError as e:
+            if 'pict_type' in str(e) or 'an integer is required' in str(e):
+                # Workaround: temporarily monkey-patch VideoFrame if needed
+                try:
+                    import av
+                    # Check PyAV version and apply fix if needed
+                    if hasattr(av.video.frame.VideoFrame, 'pict_type'):
+                        # Create wrapper that converts string to int for pict_type
+                        original_setter = av.video.frame.VideoFrame.pict_type.fset
+                        def fixed_pict_type_setter(self, value):
+                            if isinstance(value, str):
+                                # Map string values to integers (PyAV 11+ compatibility)
+                                pict_type_map = {'NONE': 0, 'I': 1, 'P': 2, 'B': 3}
+                                value = pict_type_map.get(value.upper(), 0)
+                            return original_setter(self, value)
+                        av.video.frame.VideoFrame.pict_type = property(
+                            av.video.frame.VideoFrame.pict_type.fget,
+                            fixed_pict_type_setter
+                        )
+                        # Retry with patched version
+                        result = original_write(filename, video_array, fps, video_codec, options, audio_array, audio_fps, audio_codec, audio_options)
+                        # Restore original
+                        av.video.frame.VideoFrame.pict_type = property(
+                            av.video.frame.VideoFrame.pict_type.fget,
+                            original_setter
+                        )
+                        return result
+                except Exception:
+                    pass
+            raise
+
+    torchvision.io.write_video = patched_write_video
+    try:
+        torchvision.io.write_video(output_filename, x, fps=fps, video_codec='libx264', options={'crf': str(int(crf))})
+    finally:
+        torchvision.io.write_video = original_write
+
     return x
 
 
