@@ -162,6 +162,10 @@ TORCH_COMPILE_MODE = os.environ.get('FRAMEPACK_TORCH_COMPILE_MODE', 'reduce-over
 KEEP_VAE_FP32_NORMALIZATION = _env_flag('FRAMEPACK_VAE_FP32_NORM', '1')
 MAX_LATENT_CACHE_ITEMS = int(os.environ.get('FRAMEPACK_LATENT_CACHE_SIZE', '4'))
 ENABLE_VAE_TILING = _env_flag('FRAMEPACK_VAE_TILING', '1')
+VAE_TILE_SAMPLE_MIN = int(os.environ.get('FRAMEPACK_VAE_TILE_SAMPLE', '256'))
+VAE_TILE_LATENT_MIN = int(os.environ.get('FRAMEPACK_VAE_TILE_LATENT', '64'))
+VAE_DECODE_CHUNK = int(os.environ.get('FRAMEPACK_VAE_DECODE_CHUNK', '4'))
+LATENTS_EXPORT_VERSION = 1
 
 
 def _torch_compile_kwargs(overrides=None):
@@ -253,6 +257,28 @@ def image_to_cache_key(image_array: np.ndarray) -> str:
     if image_array is None:
         return ''
     return hashlib.sha1(image_array.tobytes()).hexdigest()
+
+
+def save_latent_segments(job_id: str, segments: list, metadata: dict, directory: str) -> str | None:
+    if not segments:
+        return None
+
+    package = {
+        'metadata': metadata,
+        'segments': [
+            {
+                'latent_padding': int(seg['latent_padding']),
+                'is_last_section': bool(seg['is_last_section']),
+                'generated_latents': seg['generated_latents'],
+            }
+            for seg in segments
+        ],
+    }
+
+    os.makedirs(directory, exist_ok=True)
+    latents_path = os.path.join(directory, f'{job_id}_latents.pt')
+    torch.save(package, latents_path)
+    return latents_path
 
 
 def _wrap_norm_module_fp32(module: torch.nn.Module):
@@ -388,6 +414,16 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
     flush_rocm_allocator('worker-start')
 
+    latent_segments: list[dict] = []
+    latent_metadata = {
+        'job_id': job_id,
+        'latent_window_size': latent_window_size,
+        'mp4_crf': mp4_crf,
+        'fps': 30,
+        'version': LATENTS_EXPORT_VERSION,
+    }
+    latent_padding_history: list[int] = []
+
     try:
         # Clean GPU
         if not high_vram:
@@ -425,6 +461,8 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
         H, W, C = input_image.shape
         height, width = find_nearest_bucket(H, W, resolution=640)
+        latent_metadata['height'] = height
+        latent_metadata['width'] = width
         input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)
 
         Image.fromarray(input_image_np).save(os.path.join(outputs_folder, f'{job_id}.png'))
@@ -499,6 +537,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         for latent_padding in latent_paddings:
             is_last_section = latent_padding == 0
             latent_padding_size = latent_padding * latent_window_size
+            latent_padding_history.append(int(latent_padding))
 
             if stream.input_queue.top() == 'end':
                 stream.output_queue.push(('end', None))
@@ -578,6 +617,12 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             )
             generated_latents = _ensure_channels_last_3d(generated_latents)
 
+            latent_segments.append({
+                'latent_padding': int(latent_padding),
+                'is_last_section': bool(is_last_section),
+                'generated_latents': generated_latents.detach().to('cpu'),
+            })
+
             if is_last_section:
                 generated_latents = torch.cat([start_latent.to(generated_latents), generated_latents], dim=2)
 
@@ -609,6 +654,12 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
             if is_last_section:
                 break
+
+        latent_metadata['total_latent_frames'] = total_generated_latent_frames
+        latent_metadata['latent_paddings'] = latent_padding_history
+        latents_file = save_latent_segments(job_id, latent_segments, latent_metadata, outputs_folder)
+        if latents_file:
+            print(f'Latent segments saved to {latents_file}')
     except:
         traceback.print_exc()
 
