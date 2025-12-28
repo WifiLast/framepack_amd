@@ -166,6 +166,7 @@ VAE_TILE_SAMPLE_MIN = int(os.environ.get('FRAMEPACK_VAE_TILE_SAMPLE', '256'))
 VAE_TILE_LATENT_MIN = int(os.environ.get('FRAMEPACK_VAE_TILE_LATENT', '64'))
 VAE_DECODE_CHUNK = int(os.environ.get('FRAMEPACK_VAE_DECODE_CHUNK', '4'))
 LATENTS_EXPORT_VERSION = 1
+SKIP_IMMEDIATE_DECODE = _env_flag('FRAMEPACK_SKIP_IMMEDIATE_DECODE', '1')
 
 
 def _torch_compile_kwargs(overrides=None):
@@ -617,17 +618,24 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             )
             generated_latents = _ensure_channels_last_3d(generated_latents)
 
+            segment_latents = generated_latents
+            if is_last_section:
+                segment_latents = torch.cat([start_latent.to(segment_latents), segment_latents], dim=2)
+
             latent_segments.append({
                 'latent_padding': int(latent_padding),
                 'is_last_section': bool(is_last_section),
-                'generated_latents': generated_latents.detach().to('cpu'),
+                'generated_latents': segment_latents.detach().to('cpu'),
             })
 
-            if is_last_section:
-                generated_latents = torch.cat([start_latent.to(generated_latents), generated_latents], dim=2)
+            total_generated_latent_frames += int(segment_latents.shape[2])
 
-            total_generated_latent_frames += int(generated_latents.shape[2])
-            history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
+            if SKIP_IMMEDIATE_DECODE:
+                if is_last_section:
+                    break
+                continue
+
+            history_latents = torch.cat([segment_latents.to(history_latents), history_latents], dim=2)
 
             real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
             real_history_latents = _ensure_channels_last_3d(real_history_latents)
@@ -660,6 +668,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         latents_file = save_latent_segments(job_id, latent_segments, latent_metadata, outputs_folder)
         if latents_file:
             print(f'Latent segments saved to {latents_file}')
+            stream.output_queue.push(('latents', latents_file))
     except:
         traceback.print_exc()
 
@@ -695,6 +704,10 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
             output_filename = data
             # Force video component to update by providing explicit value
             yield gr.update(value=output_filename), gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True)
+        if flag == 'latents':
+            output_filename = data
+            desc = f'Latent segments saved to {os.path.basename(output_filename)}'
+            yield gr.update(value=None), gr.update(visible=False), desc, '', gr.update(interactive=False), gr.update(interactive=True)
 
         if flag == 'progress':
             preview, desc, html = data
