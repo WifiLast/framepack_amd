@@ -678,12 +678,13 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             stream.output_queue.push(('latents', latents_file))
     except:
         traceback.print_exc()
-
+    finally:
+        # Clean up models and GPU memory after completion or exception
         if not high_vram:
             unload_complete_models(
                 text_encoder, text_encoder_2, image_encoder, transformer
             )
-            flush_rocm_allocator('exception-cleanup')
+            flush_rocm_allocator('worker-cleanup')
 
     # Print MIOpen fallback statistics
     MIOpenFallbackHandler.print_stats()
