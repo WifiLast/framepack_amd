@@ -19,7 +19,7 @@ os.environ['TORCHINDUCTOR_CACHE_DIR'] = os.path.join(_cache_base, 'inductor')
 # Configure MIOpen for AMD GPUs to prevent convolution errors
 # Find mode and database configuration
 # CRITICAL: Use FAST mode to prevent hanging in Find phase (VAE decoder issue)
-os.environ['MIOPEN_FIND_MODE'] = 'FAST'  # Skip exhaustive search to prevent hangs
+os.environ['MIOPEN_FIND_MODE'] = '2'  # Skip exhaustive search to prevent hangs
 os.environ['MIOPEN_DEBUG_DISABLE_FIND_DB'] = '0'  # Enable find database
 os.environ['MIOPEN_FIND_ENFORCE'] = 'NONE'  # Don't enforce Find if it's slow/hanging
 
@@ -362,7 +362,7 @@ if high_vram:
 elif USE_TORCH_COMPILE:
     print('Skipping torch.compile for transformer because low-VRAM swap mode is active.')
 
-stream = AsyncStream()
+stream = None  # Will be initialized per generation
 
 outputs_folder = './outputs/'
 os.makedirs(outputs_folder, exist_ok=True)
@@ -697,6 +697,28 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
     global stream
     assert input_image is not None, 'No input image!'
 
+    # Signal any existing stream to end before starting new one
+    if stream is not None:
+        try:
+            stream.input_queue.push('end')
+            # Give the old worker thread a moment to finish
+            import time
+            time.sleep(0.5)
+        except:
+            pass
+
+    # Force GPU memory cleanup before starting new run
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    flush_rocm_allocator('pre-generation-cleanup', min_resident_gb=0.0)
+
+    # Clear torch dynamo cache if using torch.compile to prevent stale references
+    if USE_TORCH_COMPILE and hasattr(torch, '_dynamo'):
+        try:
+            torch._dynamo.reset()
+        except:
+            pass
+
     yield None, None, '', '', gr.update(interactive=False), gr.update(interactive=True)
 
     stream = AsyncStream()
@@ -705,29 +727,36 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
 
     output_filename = None
 
-    while True:
-        flag, data = stream.output_queue.next()
+    try:
+        while True:
+            flag, data = stream.output_queue.next()
 
-        if flag == 'file':
-            output_filename = data
-            # Force video component to update by providing explicit value
-            yield gr.update(value=output_filename), gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True)
-        if flag == 'latents':
-            output_filename = data
-            desc = f'Latent segments saved to {os.path.basename(output_filename)}'
-            yield gr.update(value=None), gr.update(visible=False), desc, '', gr.update(interactive=False), gr.update(interactive=True)
+            if flag == 'file':
+                output_filename = data
+                # Force video component to update by providing explicit value
+                yield gr.update(value=output_filename), gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True)
+            if flag == 'latents':
+                output_filename = data
+                desc = f'Latent segments saved to {os.path.basename(output_filename)}'
+                yield gr.update(value=None), gr.update(visible=False), desc, '', gr.update(interactive=False), gr.update(interactive=True)
 
-        if flag == 'progress':
-            preview, desc, html = data
-            yield gr.update(), gr.update(visible=True, value=preview), desc, html, gr.update(interactive=False), gr.update(interactive=True)
+            if flag == 'progress':
+                preview, desc, html = data
+                yield gr.update(), gr.update(visible=True, value=preview), desc, html, gr.update(interactive=False), gr.update(interactive=True)
 
-        if flag == 'end':
-            yield gr.update(value=output_filename), gr.update(visible=False), gr.update(), '', gr.update(interactive=True), gr.update(interactive=False)
-            break
+            if flag == 'end':
+                yield gr.update(value=output_filename), gr.update(visible=False), gr.update(), '', gr.update(interactive=True), gr.update(interactive=False)
+                break
+    except GeneratorExit:
+        # Process generator was cancelled, signal worker to stop
+        if stream is not None:
+            stream.input_queue.push('end')
+        raise
 
 
 def end_process():
-    stream.input_queue.push('end')
+    if stream is not None:
+        stream.input_queue.push('end')
 
 
 quick_prompts = [
