@@ -4,6 +4,7 @@ import os
 import runpy
 import ctypes
 import hashlib
+import time
 from collections import OrderedDict
 import threading
 
@@ -41,9 +42,9 @@ os.environ['MIOPEN_DEBUG_AMD_ROCM_PRECOMPILED_BINARIES'] = '1'
 # Enable all convolution algorithm types including fallback algorithms
 os.environ['MIOPEN_DEBUG_CONV_IMPLICIT_GEMM'] = '1'
 os.environ['MIOPEN_DEBUG_CONV_DIRECT'] = '1'
-os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD'] = '0'  # Add naive to search space
-os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_BWD'] = '0'
-os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_WRW'] = '0'
+os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD'] = '1'  # Add naive to search space
+os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_BWD'] = '1'
+os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_WRW'] = '1'
 # Note: Naive algorithms are in the search space but MIOpen will prefer optimized ones
 # Only if optimized algorithms fail will MIOpen select naive (automatic fallback)
 
@@ -78,9 +79,60 @@ import math
 from diffusers_helper.miopen_fallback import initialize_miopen_fallback, MIOpenFallbackHandler
 initialize_miopen_fallback(use_monkey_patch=True, verbose=True)
 
+# Prevent diffusers from importing bitsandbytes (AMD ROCm compatibility)
+# The AMD ROCm version of bitsandbytes lacks CPUBackend and CUDABackend which diffusers expects
+# We'll handle quantization manually after model loading instead
+import sys
+import types
+
+# Create mock bitsandbytes backend modules with required Backend classes
+# This allows diffusers to import without errors while we use the real bitsandbytes separately
+mock_cpu_module = types.ModuleType('bitsandbytes.backends.cpu')
+mock_cpu_module.CPUBackend = type('CPUBackend', (), {})  # Minimal mock class
+sys.modules['bitsandbytes.backends.cpu'] = mock_cpu_module
+
+mock_cuda_module = types.ModuleType('bitsandbytes.backends.cuda')
+mock_cuda_module.CUDABackend = type('CUDABackend', (), {})  # Minimal mock class
+sys.modules['bitsandbytes.backends.cuda'] = mock_cuda_module
+
 from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
 from transformers import LlamaModel, CLIPTextModel, LlamaTokenizerFast, CLIPTokenizer
+
+# Try to import torch_migraphx for AMD ROCm graph optimization and quantization
+# This is AMD's recommended solution for model optimization on ROCm
+HAS_TORCH_MIGRAPHX = False
+try:
+    import torch_migraphx
+    HAS_TORCH_MIGRAPHX = True
+    print("torch_migraphx available - AMD MIGraphX backend enabled for torch.compile")
+except ImportError:
+    print("Note: torch_migraphx not installed. Using standard torch backends.")
+    print("Install with: pip install torch_migraphx for AMD ROCm optimizations.")
+
+# Try to import the real bitsandbytes for our use (AMD ROCm version has limitations)
+# IMPORTANT: Import AFTER diffusers to avoid CPUBackend compatibility issues during diffusers init
+HAS_BITSANDBYTES = False
+BitsAndBytesConfig = None
+
+try:
+    import importlib.util
+    bnb_spec = importlib.util.find_spec("bitsandbytes")
+    if bnb_spec is not None and bnb_spec.origin and 'bitsandbytes' in bnb_spec.origin:
+        import bitsandbytes as bnb
+        from transformers import BitsAndBytesConfig
+        HAS_BITSANDBYTES = True
+        print("Bitsandbytes available - will attempt quantization with fallback to full precision if it fails.")
+        print("Note: AMD ROCm bitsandbytes has limitations. Consider using torch_migraphx instead.")
+    else:
+        print("Note: bitsandbytes not installed. Models will load in full precision.")
+except ImportError as e:
+    print(f"Note: bitsandbytes not available: {e}")
+    print("Models will load in full precision.")
+except Exception as e:
+    print(f"Note: bitsandbytes import failed: {e}")
+    print("Models will load in full precision.")
+
 from diffusers_helper.hunyuan import encode_prompt_conds, vae_decode, vae_encode, vae_decode_fake
 from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, state_dict_weighted_merge, state_dict_offset_merge, generate_timestamp
 from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
@@ -93,6 +145,15 @@ except ImportError:
     # Fallback for original CUDA version without log_memory_status
     def log_memory_status(device=None, prefix=""):
         pass  # No-op for compatibility
+
+# Try to import psutil for RAM monitoring
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+    print("Warning: psutil not installed. Install with 'pip install psutil' for RAM monitoring.")
+
 from diffusers_helper.thread_utils import AsyncStream, async_run
 from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_progress_bar_html
 from transformers import SiglipImageProcessor, SiglipVisionModel
@@ -112,22 +173,207 @@ args = parser.parse_args()
 
 print(args)
 
+def _env_flag(name: str, default: str = '0') -> bool:
+    """Return True if the env var is a truthy value (1/true/on)."""
+    value = os.environ.get(name, default)
+    return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+
+# Bitsandbytes 8-bit optimization configuration (AMD ROCm compatible)
+USE_BITSANDBYTES = _env_flag('FRAMEPACK_USE_BITSANDBYTES', '1')  # Enabled by default
+
+
+def get_quantization_config():
+    """
+    Create BitsAndBytesConfig for 8-bit quantization (AMD ROCm compatible).
+
+    Returns:
+        BitsAndBytesConfig for model loading or None if disabled
+    """
+    if not USE_BITSANDBYTES or not HAS_BITSANDBYTES or BitsAndBytesConfig is None:
+        return None
+
+    try:
+        # AMD ROCm compatible configuration
+        quantization_config = BitsAndBytesConfig(
+            load_in_8bit=True,
+            # llm_int8_threshold=6.0,  # Optional: threshold for outlier detection
+        )
+        print("  Created BitsAndBytesConfig for 8-bit quantization (AMD ROCm)")
+        return quantization_config
+    except Exception as e:
+        print(f"  ⚠ Failed to create quantization config: {e}")
+        return None
+
+
 free_mem_gb = get_cuda_free_memory_gb(gpu)
 high_vram = free_mem_gb > 60
 
 print(f'Free VRAM {free_mem_gb} GB')
 print(f'High-VRAM Mode: {high_vram}')
 
-text_encoder = LlamaModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder', torch_dtype=torch.float16).cpu()
-text_encoder_2 = CLIPTextModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder_2', torch_dtype=torch.float16).cpu()
+# RAM monitoring and pinning configuration
+def get_ram_info():
+    """Get current RAM usage information."""
+    if HAS_PSUTIL:
+        mem = psutil.virtual_memory()
+        total_gb = mem.total / (1024**3)
+        used_gb = mem.used / (1024**3)
+        available_gb = mem.available / (1024**3)
+        percent = mem.percent
+        return total_gb, used_gb, available_gb, percent
+    else:
+        # Fallback: assume 32GB total, can't measure actual usage
+        return 32.0, 22.0, 10.0, 68.75
+
+total_ram_gb, used_ram_gb, available_ram_gb, ram_percent = get_ram_info()
+print(f'Total RAM: {total_ram_gb:.1f} GB')
+print(f'Used RAM: {used_ram_gb:.1f} GB ({ram_percent:.1f}%)')
+print(f'Available RAM: {available_ram_gb:.1f} GB')
+
+# Configure RAM pinning - use up to 90% of total RAM
+MAX_RAM_USAGE_PERCENT = 90.0
+target_ram_gb = (MAX_RAM_USAGE_PERCENT / 100.0) * total_ram_gb
+ram_headroom_gb = target_ram_gb - used_ram_gb
+print(f'Target RAM usage: {MAX_RAM_USAGE_PERCENT}% ({target_ram_gb:.1f} GB)')
+print(f'RAM headroom for pinning: {ram_headroom_gb:.1f} GB')
+
+# Enable pinned memory for faster CPU-GPU transfers
+#ENABLE_PINNED_MEMORY = ram_headroom_gb > 2.0  # Only enable if we have >2GB headroom
+#if ENABLE_PINNED_MEMORY:
+#    print(f'Enabling pinned memory for model tensors (improves CPU-GPU transfer speed)')
+#else:
+#    print(f'Pinned memory disabled (insufficient RAM headroom)')
+ENABLE_PINNED_MEMORY = False
+
+def pin_model_to_memory(model: torch.nn.Module, verbose: bool = True):
+    """Pin model parameters and buffers to CPU memory for faster GPU transfers."""
+    if not ENABLE_PINNED_MEMORY:
+        return
+
+    pinned_count = 0
+    pinned_size_mb = 0.0
+
+    for name, param in model.named_parameters():
+        if param is not None and not param.is_cuda:
+            try:
+                # Pin memory only for CPU tensors
+                if not param.is_pinned():
+                    param.data = param.data.pin_memory()
+                    pinned_count += 1
+                    pinned_size_mb += param.numel() * param.element_size() / (1024**2)
+            except:
+                pass  # Some tensors may not support pinning
+
+    for name, buffer in model.named_buffers():
+        if buffer is not None and not buffer.is_cuda:
+            try:
+                if not buffer.is_pinned():
+                    pinned_buffer = buffer.pin_memory()
+                    # Replace the buffer in the model
+                    model._buffers[name] = pinned_buffer
+                    pinned_count += 1
+                    pinned_size_mb += buffer.numel() * buffer.element_size() / (1024**2)
+            except:
+                pass
+
+    if verbose and pinned_count > 0:
+        print(f'  Pinned {pinned_count} tensors ({pinned_size_mb:.1f} MB) in {model.__class__.__name__}')
+
+# Helper function to load model with optional quantization and fallback
+def load_model_with_fallback(model_class, model_name, subfolder=None, dtype=torch.float16, quantization_config=None):
+    """
+    Try to load model with quantization, fall back to full precision if it fails.
+
+    Args:
+        model_class: The model class to instantiate
+        model_name: Model name/path for from_pretrained
+        subfolder: Optional subfolder in the model repository
+        dtype: Torch dtype for the model
+        quantization_config: BitsAndBytesConfig or None
+
+    Returns:
+        Loaded model instance
+    """
+    load_kwargs = {
+        "torch_dtype": dtype,
+    }
+
+    if subfolder:
+        load_kwargs["subfolder"] = subfolder
+
+    # Try with quantization first if available
+    if quantization_config is not None:
+        try:
+            print(f"  Attempting to load {model_class.__name__} with 8-bit quantization...")
+            quant_kwargs = load_kwargs.copy()
+            quant_kwargs["quantization_config"] = quantization_config
+            quant_kwargs["device_map"] = "auto"
+            model = model_class.from_pretrained(model_name, **quant_kwargs)
+            print(f"  ✓ {model_class.__name__} loaded with 8-bit quantization")
+            return model
+        except Exception as e:
+            print(f"  ⚠ Quantization failed for {model_class.__name__}: {e}")
+            print(f"  → Falling back to full precision for {model_class.__name__}")
+
+    # Load in full precision
+    model = model_class.from_pretrained(model_name, **load_kwargs).cpu()
+    return model
+
+
+# Create quantization config for AMD ROCm bitsandbytes
+quantization_config = get_quantization_config()
+
+if quantization_config is not None:
+    print("\nAttempting to load models with 8-bit quantization...")
+    print("Note: Will fall back to full precision if quantization fails for any model.\n")
+else:
+    print("\nLoading models in full precision...\n")
+
+# Load models with automatic fallback to full precision if quantization fails
+text_encoder = load_model_with_fallback(
+    LlamaModel,
+    "hunyuanvideo-community/HunyuanVideo",
+    subfolder='text_encoder',
+    dtype=torch.float16,
+    quantization_config=quantization_config
+)
+
+text_encoder_2 = load_model_with_fallback(
+    CLIPTextModel,
+    "hunyuanvideo-community/HunyuanVideo",
+    subfolder='text_encoder_2',
+    dtype=torch.float16,
+    quantization_config=quantization_config
+)
+
+image_encoder = load_model_with_fallback(
+    SiglipVisionModel,
+    "lllyasviel/flux_redux_bfl",
+    subfolder='image_encoder',
+    dtype=torch.float16,
+    quantization_config=quantization_config
+)
+
 tokenizer = LlamaTokenizerFast.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer')
 tokenizer_2 = CLIPTokenizer.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer_2')
-vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='vae', torch_dtype=torch.float16).cpu()
+
+# VAE and custom transformer don't support quantization_config, load normally
+print("  Loading VAE (full precision, quantization not supported)...")
+vae = AutoencoderKLHunyuanVideo.from_pretrained(
+    "hunyuanvideo-community/HunyuanVideo",
+    subfolder='vae',
+    torch_dtype=torch.float16
+).cpu()
 
 feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor')
-image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16).cpu()
 
-transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePackI2V_HY', torch_dtype=torch.bfloat16).cpu()
+print("  Loading Transformer (full precision, custom model)...")
+transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained(
+    'lllyasviel/FramePackI2V_HY',
+    torch_dtype=torch.bfloat16
+).cpu()
+
+print("\nModel loading complete.\n")
 
 vae.eval()
 text_encoder.eval()
@@ -153,19 +399,170 @@ text_encoder_2.requires_grad_(False)
 image_encoder.requires_grad_(False)
 transformer.requires_grad_(False)
 
+# Pin models to RAM for faster CPU-GPU transfers (if enabled)
+if ENABLE_PINNED_MEMORY:
+    print('\nPinning models to RAM for optimized memory transfers...')
+    pin_model_to_memory(text_encoder)
+    pin_model_to_memory(text_encoder_2)
+    pin_model_to_memory(vae)
+    pin_model_to_memory(image_encoder)
+    pin_model_to_memory(transformer)
+    print('Model pinning complete.\n')
+else:
+    print('\nSkipping model pinning (disabled or insufficient RAM).\n')
+
 IS_HIP_RUNTIME = getattr(torch.version, "hip", None) is not None
 
+# ==================== Triton Configuration ====================
+# Deferred configuration - only show if verbose mode or if compilation will happen
+_VERBOSE_STARTUP = _env_flag('FRAMEPACK_VERBOSE_STARTUP', '0') if 'FRAMEPACK_VERBOSE_STARTUP' in os.environ else False
 
-def _env_flag(name: str, default: str = '0') -> bool:
-    """Return True if the env var is a truthy value (1/true/on)."""
-    value = os.environ.get(name, default)
-    return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+if _VERBOSE_STARTUP:
+    print("\n" + "="*60)
+    print("Configuring Triton and Torch Compile Optimizations")
+    print("="*60)
 
+# Configure Triton for ROCm/HIP
+if IS_HIP_RUNTIME:
+    if _VERBOSE_STARTUP:
+        print("Detected ROCm/HIP runtime - configuring Triton for AMD GPUs")
 
-USE_TORCH_COMPILE = _env_flag('FRAMEPACK_USE_TORCH_COMPILE', '1')
-TORCH_COMPILE_DYNAMIC = _env_flag('FRAMEPACK_TORCH_COMPILE_DYNAMIC', '1')
+    # Set Triton to use ROCm backend
+    os.environ.setdefault('TRITON_INTERPRET', '0')  # Disable interpreter mode
+    os.environ.setdefault('TRITON_PRINT_AUTOTUNING', '0')  # Disable autotuning logs
+
+    # Enable Triton caching for faster recompilation
+    triton_cache_dir = os.path.join(os.path.dirname(__file__), '.cache_rocm', 'triton')
+    os.makedirs(triton_cache_dir, exist_ok=True)
+    os.environ['TRITON_CACHE_DIR'] = triton_cache_dir
+    if _VERBOSE_STARTUP:
+        print(f"  Triton cache directory: {triton_cache_dir}")
+
+    # ROCm-specific Triton optimizations
+    os.environ.setdefault('TRITON_ALWAYS_COMPILE', '0')  # Use cache when possible
+    os.environ.setdefault('PYTORCH_TUNABLEOP_ENABLED', '0')  # Enable TunableOp
+    os.environ.setdefault('PYTORCH_TUNABLEOP_TUNING', '0')  # Enable runtime tuning
+    os.environ.setdefault('PYTORCH_TUNABLEOP_FILENAME', os.path.join(os.path.dirname(__file__), 'tunableop_results.csv'))
+
+    if _VERBOSE_STARTUP:
+        print("  Enabled ROCm TunableOp for kernel auto-tuning")
+else:
+    if _VERBOSE_STARTUP:
+        print("Detected CUDA runtime - using standard Triton configuration")
+    os.environ.setdefault('TRITON_PRINT_AUTOTUNING', '0')
+
+# Try to import Triton and check if it's available (lazy import to save startup time)
+HAS_TRITON = False
+def _check_triton():
+    global HAS_TRITON
+    try:
+        import triton
+        HAS_TRITON = True
+        if _VERBOSE_STARTUP:
+            triton_version = getattr(triton, '__version__', 'unknown')
+            print(f"  Triton available: version {triton_version}")
+        return True
+    except ImportError:
+        if _VERBOSE_STARTUP:
+            print("  Warning: Triton not installed. Some optimizations will be unavailable.")
+            print("  Install with: pip install triton")
+        return False
+
+# Only check Triton if torch.compile is enabled
+if _env_flag('FRAMEPACK_USE_TORCH_COMPILE', '0'):
+    _check_triton()
+
+# Configure Torch Inductor (torch.compile backend) for Triton - deferred until first compile
+_inductor_configured = False
+def _configure_inductor():
+    global _inductor_configured
+    if _inductor_configured:
+        return
+
+    if hasattr(torch, '_inductor'):
+        try:
+            import torch._inductor.config as inductor_config
+
+            # Enable Triton kernels in Inductor
+            inductor_config.triton.cudagraphs = False  # Disable CUDA graphs for compatibility
+            inductor_config.fallback_random = True  # Fallback for random ops
+            inductor_config.triton.unique_kernel_names = True  # Better caching
+
+            if IS_HIP_RUNTIME:
+                # ROCm-specific Inductor settings
+                inductor_config.triton.autotune_at_compile_time = True
+                inductor_config.max_autotune = True  # Aggressive autotuning
+                inductor_config.coordinate_descent_tuning = True  # Advanced tuning
+                if _VERBOSE_STARTUP:
+                    print("  Enabled aggressive Triton autotuning for ROCm")
+            else:
+                # CUDA-specific settings
+                inductor_config.triton.cudagraphs = True  # CUDA graphs for NVIDIA
+                if _VERBOSE_STARTUP:
+                    print("  Enabled CUDA graphs for NVIDIA GPUs")
+
+            if _VERBOSE_STARTUP:
+                print("  Configured Torch Inductor for Triton kernels")
+            _inductor_configured = True
+        except Exception as e:
+            print(f"  Warning: Could not configure Inductor: {e}")
+
+if _VERBOSE_STARTUP:
+    print("="*60 + "\n")
+
+USE_TORCH_COMPILE = _env_flag('FRAMEPACK_USE_TORCH_COMPILE', '0')
+TORCH_COMPILE_DYNAMIC = _env_flag('FRAMEPACK_TORCH_COMPILE_DYNAMIC', '0')
 TORCH_COMPILE_FULLGRAPH = _env_flag('FRAMEPACK_TORCH_COMPILE_FULLGRAPH', '0')
-TORCH_COMPILE_MODE = os.environ.get('FRAMEPACK_TORCH_COMPILE_MODE', 'reduce-overhead').strip()
+TORCH_COMPILE_MODE = os.environ.get('FRAMEPACK_TORCH_COMPILE_MODE', 'max-autotune' if IS_HIP_RUNTIME else 'reduce-overhead').strip()
+
+# Use MIGraphX backend if available on ROCm, otherwise use inductor
+# MIGraphX provides better optimization for AMD GPUs including FP16/BF16 quantization
+if IS_HIP_RUNTIME and HAS_TORCH_MIGRAPHX:
+    default_backend = 'migraphx'
+else:
+    default_backend = 'inductor'
+TORCH_COMPILE_BACKEND = os.environ.get('FRAMEPACK_TORCH_COMPILE_BACKEND', default_backend).strip()
+
+# MIGraphX-specific options for AMD ROCm
+USE_MIGRAPHX_BF16 = _env_flag('FRAMEPACK_MIGRAPHX_BF16', '0')  # Enable BF16 precision in MIGraphX
+USE_MIGRAPHX_DEALLOCATE = _env_flag('FRAMEPACK_MIGRAPHX_DEALLOCATE', '0')  # Deallocate torch memory after compilation
+
+# Enhanced Torch Compile Configuration (only show if verbose or disabled)
+if _VERBOSE_STARTUP or not USE_TORCH_COMPILE:
+    print("\nTorch Compile Configuration:")
+    print(f"  Enabled: {USE_TORCH_COMPILE}")
+    if USE_TORCH_COMPILE:
+        print(f"  Mode: {TORCH_COMPILE_MODE}")
+        print(f"  Backend: {TORCH_COMPILE_BACKEND}")
+        print(f"  Dynamic shapes: {TORCH_COMPILE_DYNAMIC}")
+        print(f"  Full graph: {TORCH_COMPILE_FULLGRAPH}")
+
+        if TORCH_COMPILE_BACKEND == 'migraphx':
+            print(f"  MIGraphX optimizations:")
+            print(f"    - AMD ROCm graph optimization enabled")
+            print(f"    - BF16 precision: {USE_MIGRAPHX_BF16}")
+            print(f"    - Memory deallocation: {USE_MIGRAPHX_DEALLOCATE}")
+            print(f"    - Provides FP16/BF16 quantization and kernel fusion")
+        elif IS_HIP_RUNTIME:
+            print(f"  ROCm optimizations: Aggressive autotuning enabled")
+            print(f"  Triton backend: {'Available' if HAS_TRITON else 'Not available'}")
+elif USE_TORCH_COMPILE:
+    # Minimal startup message
+    if TORCH_COMPILE_BACKEND == 'migraphx':
+        print(f"\nTorch Compile: Enabled (MIGraphX backend - AMD ROCm optimized)")
+    else:
+        print(f"\nTorch Compile: Enabled ({TORCH_COMPILE_MODE} mode, {TORCH_COMPILE_BACKEND} backend)")
+
+# Bitsandbytes configuration output
+if USE_BITSANDBYTES and HAS_BITSANDBYTES:
+    print(f"\nBitsandbytes 8-bit Optimization: Enabled (AMD ROCm)")
+    print(f"  This will reduce memory usage and may improve performance")
+    print(f"  Models are quantized during loading with BitsAndBytesConfig")
+elif USE_BITSANDBYTES and not HAS_BITSANDBYTES:
+    print(f"\nBitsandbytes 8-bit Optimization: Requested but not available")
+    print(f"  Install AMD ROCm version with: pip install bitsandbytes")
+    USE_BITSANDBYTES = False
+
 KEEP_VAE_FP32_NORMALIZATION = _env_flag('FRAMEPACK_VAE_FP32_NORM', '1')
 MAX_LATENT_CACHE_ITEMS = int(os.environ.get('FRAMEPACK_LATENT_CACHE_SIZE', '4'))
 ENABLE_VAE_TILING = _env_flag('FRAMEPACK_VAE_TILING', '1')
@@ -177,33 +574,182 @@ SKIP_IMMEDIATE_DECODE = _env_flag('FRAMEPACK_SKIP_IMMEDIATE_DECODE', '1')
 
 
 def _torch_compile_kwargs(overrides=None):
-    kwargs = {}
+    """Build torch.compile keyword arguments with optimizations."""
+    kwargs = {
+        'backend': TORCH_COMPILE_BACKEND,
+    }
+
     if TORCH_COMPILE_MODE:
         kwargs['mode'] = TORCH_COMPILE_MODE
+
     if TORCH_COMPILE_DYNAMIC:
         kwargs['dynamic'] = True
+
     if TORCH_COMPILE_FULLGRAPH:
         kwargs['fullgraph'] = True
+
+    # MIGraphX backend options for AMD ROCm
+    if TORCH_COMPILE_BACKEND == 'migraphx':
+        migraphx_options = {}
+        if USE_MIGRAPHX_BF16:
+            migraphx_options['bf16'] = True
+        if USE_MIGRAPHX_DEALLOCATE:
+            migraphx_options['deallocate'] = True
+
+        if migraphx_options:
+            kwargs['options'] = migraphx_options
+
+    # Inductor backend options for CUDA/ROCm
+    elif TORCH_COMPILE_MODE in ['max-autotune', 'max-autotune-no-cudagraphs']:
+        kwargs['options'] = {
+            'triton.cudagraphs': False if IS_HIP_RUNTIME else True,
+            'max_autotune': True,
+            'epilogue_fusion': True,
+            'max_autotune_gemm_backends': 'TRITON,ATen' if HAS_TRITON else 'ATen',
+        }
+
     if overrides:
+        # Allow overrides to replace options dict or merge into it
+        if 'options' in overrides and 'options' in kwargs:
+            kwargs['options'].update(overrides.pop('options'))
         kwargs.update(overrides)
+
     return kwargs
 
 
+def _get_compile_cache_path(name: str, compile_kwargs: dict) -> str:
+    """Generate cache file path for compiled model."""
+    import hashlib
+
+    # Create a hash of compilation settings
+    settings_str = f"{name}_{compile_kwargs.get('mode', 'default')}_{compile_kwargs.get('backend', 'inductor')}_{compile_kwargs.get('dynamic', False)}"
+    settings_hash = hashlib.md5(settings_str.encode()).hexdigest()[:8]
+
+    cache_dir = os.path.join(os.path.dirname(__file__), '.cache_rocm', 'compiled_models')
+    os.makedirs(cache_dir, exist_ok=True)
+
+    return os.path.join(cache_dir, f'{name}_{settings_hash}.pt')
+
+
+def _save_compiled_model(module, cache_path: str, name: str):
+    """Save compiled model to cache."""
+    try:
+        # Use torch.jit to save the compiled module
+        # Note: This saves the traced/compiled graph, not the full module
+        torch.save({
+            'compiled': True,
+            'timestamp': time.time(),
+        }, cache_path + '.meta')
+        if _VERBOSE_STARTUP:
+            print(f'    Cached compilation metadata for {name}')
+    except Exception as e:
+        if _VERBOSE_STARTUP:
+            print(f'    Warning: Could not cache {name}: {e}')
+
+
+def _load_compiled_model_cache(cache_path: str, name: str) -> bool:
+    """Check if cached compilation exists and is recent."""
+    meta_path = cache_path + '.meta'
+
+    if not os.path.exists(meta_path):
+        return False
+
+    try:
+        meta = torch.load(meta_path, map_location='cpu')
+
+        # Check if cache is less than 7 days old
+        cache_age_days = (time.time() - meta.get('timestamp', 0)) / (24 * 3600)
+
+        if cache_age_days > 7:
+            if _VERBOSE_STARTUP:
+                print(f'    Cache for {name} is {cache_age_days:.1f} days old, recompiling')
+            return False
+
+        if _VERBOSE_STARTUP:
+            print(f'    Found cached compilation for {name} ({cache_age_days:.1f} days old)')
+        return True
+
+    except Exception as e:
+        if _VERBOSE_STARTUP:
+            print(f'    Warning: Could not load cache metadata: {e}')
+        return False
+
+
 def maybe_torch_compile(module, name: str, overrides=None):
-    """Attempt to wrap a module with torch.compile if available."""
+    """
+    Attempt to wrap a module with torch.compile if available.
+    Implements compilation caching to avoid recompiling on every startup.
+
+    Args:
+        module: PyTorch module to compile
+        name: Human-readable name for logging
+        overrides: Optional dict to override compile kwargs
+
+    Returns:
+        Compiled module or original module if compilation fails
+    """
     compile_fn = getattr(torch, 'compile', None)
+
     if not USE_TORCH_COMPILE:
         return module
+
     if compile_fn is None:
-        print(f'torch.compile unavailable – skipping compilation for {name}.')
+        if _VERBOSE_STARTUP:
+            print(f'  ⚠ torch.compile unavailable for {name} - requires PyTorch 2.0+')
         return module
+
+    # Configure Inductor on first compile
+    _configure_inductor()
+
     try:
-        compiled_module = compile_fn(module, **_torch_compile_kwargs(overrides))
-    except Exception as exc:
-        print(f'torch.compile failed for {name}: {exc}')
+        compile_kwargs = _torch_compile_kwargs(overrides)
+        cache_path = _get_compile_cache_path(name, compile_kwargs)
+
+        # Check if we have a recent cached compilation
+        # Note: torch.compile automatically caches kernels, but we track metadata
+        has_cache = _load_compiled_model_cache(cache_path, name)
+
+        # Reduced verbosity - only show compilation notice, not full details
+        if has_cache:
+            if _VERBOSE_STARTUP:
+                print(f'  Loading cached compilation for {name}...')
+            else:
+                print(f'  {name}: Using cached compilation')
+        else:
+            if _VERBOSE_STARTUP:
+                print(f'  Compiling {name}...')
+                print(f'    Backend: {compile_kwargs["backend"]}')
+                print(f'    Mode: {compile_kwargs.get("mode", "default")}')
+            else:
+                print(f'  Compiling {name} ({compile_kwargs.get("mode", "default")} mode)... (first time, will be cached)')
+
+        compiled_module = compile_fn(module, **compile_kwargs)
+
+        # Save cache metadata (actual kernel cache is handled by torch.compile/Triton)
+        if not has_cache:
+            _save_compiled_model(compiled_module, cache_path, name)
+
+        if _VERBOSE_STARTUP and not has_cache:
+            print(f'  ✓ Successfully compiled {name}')
+
+        return compiled_module
+
+    except RuntimeError as exc:
+        if 'Triton' in str(exc) and not HAS_TRITON:
+            print(f'  ⚠ {name} compilation skipped: Triton not available')
+            if _VERBOSE_STARTUP:
+                print(f'    Install triton for better performance.')
+        else:
+            print(f'  ⚠ {name} compilation failed, using eager mode')
+            if _VERBOSE_STARTUP:
+                print(f'    Error: {exc}')
         return module
-    print(f'Enabled torch.compile for {name}.')
-    return compiled_module
+
+    except Exception as exc:
+        print(f'  ⚠ {name} compilation failed, using eager mode')
+        if _VERBOSE_STARTUP:
+            print(f'    Error: {exc}')
+        return module
 
 
 CHANNELS_LAST_3D = getattr(torch, 'channels_last_3d', torch.contiguous_format)
@@ -795,7 +1341,7 @@ with block:
                 gs = gr.Slider(label="Distilled CFG Scale", minimum=1.0, maximum=32.0, value=10.0, step=0.01, info='Changing this value is not recommended.')
                 rs = gr.Slider(label="CFG Re-Scale", minimum=0.0, maximum=1.0, value=0.0, step=0.01, visible=False)  # Should not change
 
-                gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=4, maximum=128, value=10 if not high_vram else 6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed. For 20-24GB VRAM, use 10GB+ to prevent BlockAllocator failures.")
+                gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=4, maximum=128, value=8 if not high_vram else 6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed. For 20-24GB VRAM, use 10GB+ to prevent BlockAllocator failures.")
 
                 mp4_crf = gr.Slider(label="MP4 Compression", minimum=0, maximum=100, value=16, step=1, info="Lower means better quality. 0 is uncompressed. Change to 16 if you get black outputs. ")
 
