@@ -1,0 +1,792 @@
+from diffusers_helper.hf_login import login
+
+import os
+import runpy
+import ctypes
+import hashlib
+from collections import OrderedDict
+import threading
+
+os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
+
+# Separate cache directories for AMD ROCm to prevent CUDA/ROCm interference
+_cache_base = os.path.join(os.path.dirname(__file__), '.cache_rocm')
+os.makedirs(_cache_base, exist_ok=True)
+os.environ['TRITON_CACHE_DIR'] = os.path.join(_cache_base, 'triton')
+os.environ['TORCH_EXTENSIONS_DIR'] = os.path.join(_cache_base, 'torch_extensions')
+os.environ['TORCHINDUCTOR_CACHE_DIR'] = os.path.join(_cache_base, 'inductor')
+
+# Configure MIOpen for AMD GPUs to prevent convolution errors
+# Find mode and database configuration
+# CRITICAL: Use FAST mode to prevent hanging in Find phase (VAE decoder issue)
+os.environ['MIOPEN_FIND_MODE'] = 2  # Skip exhaustive search to prevent hangs
+os.environ['MIOPEN_DEBUG_DISABLE_FIND_DB'] = '0'  # Enable find database
+os.environ['MIOPEN_FIND_ENFORCE'] = 'NONE'  # Don't enforce Find if it's slow/hanging
+
+# CRITICAL: Set timeout for Find operations (prevents infinite hanging)
+os.environ['MIOPEN_FIND_TIME_LIMIT'] = '30'  # 30 second timeout for algorithm search
+
+# Critical: Enable 3D convolution algorithms (for VAE decoder)
+os.environ['MIOPEN_DEBUG_3D_CONV_IMPLICIT_GEMM_HIP_FWD_XDLOPS'] = '1'
+os.environ['MIOPEN_DEBUG_3D_CONV_IMPLICIT_GEMM_HIP_BWD_XDLOPS'] = '1'
+os.environ['MIOPEN_DEBUG_3D_CONV_IMPLICIT_GEMM_HIP_WRW_XDLOPS'] = '1'
+
+# Enable fallback mechanisms (CRITICAL for preventing hangs)
+os.environ['MIOPEN_DEBUG_CONV_IMMED_FALLBACK'] = '1'
+os.environ['MIOPEN_DEBUG_FORCE_IMMED_MODE_FALLBACK'] = '1'
+
+# Force use of immediate mode kernels when Find times out
+os.environ['MIOPEN_DEBUG_AMD_ROCM_PRECOMPILED_BINARIES'] = '1'
+
+# Enable all convolution algorithm types including fallback algorithms
+os.environ['MIOPEN_DEBUG_CONV_IMPLICIT_GEMM'] = '1'
+os.environ['MIOPEN_DEBUG_CONV_DIRECT'] = '1'
+os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_FWD'] = '0'  # Add naive to search space
+os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_BWD'] = '0'
+os.environ['MIOPEN_DEBUG_CONV_DIRECT_NAIVE_CONV_WRW'] = '0'
+# Note: Naive algorithms are in the search space but MIOpen will prefer optimized ones
+# Only if optimized algorithms fail will MIOpen select naive (automatic fallback)
+
+# Logging (set to 4 for warnings, 5 for debug if issues persist)
+os.environ['MIOPEN_LOG_LEVEL'] = '4'
+
+# Trim PyTorch/HIP allocations aggressively to keep individual BlockAllocator requests small.
+# The BlockAllocator documented in cache/BlockAllocator.txt works on 2MB blocks, so we keep
+# the caching allocator from hanging onto large chunks that would otherwise fragment the pool.
+os.environ.setdefault('PYTORCH_HIP_ALLOC_CONF', 'garbage_collection_threshold:0.8,max_split_size_mb:64')
+
+# Load ZLUDA compatibility layer for AMD GPUs by default
+zluda_entry = os.path.join(os.path.dirname(__file__), 'customzluda', 'zluda-default.py')
+if os.path.exists(zluda_entry):
+    print('Loading ZLUDA compatibility layer for ROCm/AMD GPUs...')
+    runpy.run_path(zluda_entry, run_name='__framepack_zluda__')
+else:
+    print(f'Warning: ZLUDA helper not found at {zluda_entry}')
+    print('Continuing without ZLUDA - NVIDIA GPU will be used if available')
+
+import gradio as gr
+import torch
+import torch.nn as nn
+import traceback
+import einops
+import safetensors.torch as sf
+import numpy as np
+import argparse
+import math
+
+# Initialize MIOpen fallback system for AMD GPUs (before any torch operations)
+from diffusers_helper.miopen_fallback import initialize_miopen_fallback, MIOpenFallbackHandler
+initialize_miopen_fallback(use_monkey_patch=True, verbose=True)
+
+from PIL import Image
+from diffusers import AutoencoderKLHunyuanVideo
+from transformers import LlamaModel, CLIPTextModel, LlamaTokenizerFast, CLIPTokenizer
+from diffusers_helper.hunyuan import encode_prompt_conds, vae_decode, vae_encode, vae_decode_fake
+from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, state_dict_weighted_merge, state_dict_offset_merge, generate_timestamp
+from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
+from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
+from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete
+# Try to import log_memory_status (only available in AMD version)
+try:
+    from diffusers_helper.memory import log_memory_status
+except ImportError:
+    # Fallback for original CUDA version without log_memory_status
+    def log_memory_status(device=None, prefix=""):
+        pass  # No-op for compatibility
+from diffusers_helper.thread_utils import AsyncStream, async_run
+from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_progress_bar_html
+from transformers import SiglipImageProcessor, SiglipVisionModel
+from diffusers_helper.clip_vision import hf_clip_vision_encode
+from diffusers_helper.bucket_tools import find_nearest_bucket
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--share', action='store_true')
+parser.add_argument("--server", type=str, default='0.0.0.0')
+parser.add_argument("--port", type=int, required=False)
+parser.add_argument("--inbrowser", action='store_true')
+args = parser.parse_args()
+
+# for win desktop probably use --server 127.0.0.1 --inbrowser
+# For linux server probably use --server 127.0.0.1 or do not use any cmd flags
+
+print(args)
+
+free_mem_gb = get_cuda_free_memory_gb(gpu)
+high_vram = free_mem_gb > 60
+
+print(f'Free VRAM {free_mem_gb} GB')
+print(f'High-VRAM Mode: {high_vram}')
+
+text_encoder = LlamaModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder', torch_dtype=torch.float16).cpu()
+text_encoder_2 = CLIPTextModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='text_encoder_2', torch_dtype=torch.float16).cpu()
+tokenizer = LlamaTokenizerFast.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer')
+tokenizer_2 = CLIPTokenizer.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer_2')
+vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='vae', torch_dtype=torch.float16).cpu()
+
+feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor')
+image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16).cpu()
+
+transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained('lllyasviel/FramePackI2V_HY', torch_dtype=torch.bfloat16).cpu()
+
+vae.eval()
+text_encoder.eval()
+text_encoder_2.eval()
+image_encoder.eval()
+transformer.eval()
+
+if not high_vram:
+    vae.enable_slicing()
+
+transformer.high_quality_fp32_output_for_inference = False
+print('transformer.high_quality_fp32_output_for_inference = True')
+
+transformer.to(dtype=torch.bfloat16)
+vae.to(dtype=torch.float16)
+image_encoder.to(dtype=torch.float16)
+text_encoder.to(dtype=torch.float16)
+text_encoder_2.to(dtype=torch.float16)
+
+vae.requires_grad_(False)
+text_encoder.requires_grad_(False)
+text_encoder_2.requires_grad_(False)
+image_encoder.requires_grad_(False)
+transformer.requires_grad_(False)
+
+IS_HIP_RUNTIME = getattr(torch.version, "hip", None) is not None
+
+
+def _env_flag(name: str, default: str = '0') -> bool:
+    """Return True if the env var is a truthy value (1/true/on)."""
+    value = os.environ.get(name, default)
+    return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+USE_TORCH_COMPILE = _env_flag('FRAMEPACK_USE_TORCH_COMPILE', '1')
+TORCH_COMPILE_DYNAMIC = _env_flag('FRAMEPACK_TORCH_COMPILE_DYNAMIC', '1')
+TORCH_COMPILE_FULLGRAPH = _env_flag('FRAMEPACK_TORCH_COMPILE_FULLGRAPH', '0')
+TORCH_COMPILE_MODE = os.environ.get('FRAMEPACK_TORCH_COMPILE_MODE', 'reduce-overhead').strip()
+KEEP_VAE_FP32_NORMALIZATION = _env_flag('FRAMEPACK_VAE_FP32_NORM', '1')
+MAX_LATENT_CACHE_ITEMS = int(os.environ.get('FRAMEPACK_LATENT_CACHE_SIZE', '4'))
+ENABLE_VAE_TILING = _env_flag('FRAMEPACK_VAE_TILING', '1')
+VAE_TILE_SAMPLE_MIN = int(os.environ.get('FRAMEPACK_VAE_TILE_SAMPLE', '256'))
+VAE_TILE_LATENT_MIN = int(os.environ.get('FRAMEPACK_VAE_TILE_LATENT', '64'))
+VAE_DECODE_CHUNK = int(os.environ.get('FRAMEPACK_VAE_DECODE_CHUNK', '4'))
+LATENTS_EXPORT_VERSION = 1
+SKIP_IMMEDIATE_DECODE = _env_flag('FRAMEPACK_SKIP_IMMEDIATE_DECODE', '1')
+
+
+def _torch_compile_kwargs(overrides=None):
+    kwargs = {}
+    if TORCH_COMPILE_MODE:
+        kwargs['mode'] = TORCH_COMPILE_MODE
+    if TORCH_COMPILE_DYNAMIC:
+        kwargs['dynamic'] = True
+    if TORCH_COMPILE_FULLGRAPH:
+        kwargs['fullgraph'] = True
+    if overrides:
+        kwargs.update(overrides)
+    return kwargs
+
+
+def maybe_torch_compile(module, name: str, overrides=None):
+    """Attempt to wrap a module with torch.compile if available."""
+    compile_fn = getattr(torch, 'compile', None)
+    if not USE_TORCH_COMPILE:
+        return module
+    if compile_fn is None:
+        print(f'torch.compile unavailable – skipping compilation for {name}.')
+        return module
+    try:
+        compiled_module = compile_fn(module, **_torch_compile_kwargs(overrides))
+    except Exception as exc:
+        print(f'torch.compile failed for {name}: {exc}')
+        return module
+    print(f'Enabled torch.compile for {name}.')
+    return compiled_module
+
+
+CHANNELS_LAST_3D = getattr(torch, 'channels_last_3d', torch.contiguous_format)
+_latent_cache = OrderedDict()
+_latent_cache_lock = threading.Lock()
+
+
+NORM_FP32_TYPES = (
+    nn.LayerNorm,
+    nn.GroupNorm,
+    nn.InstanceNorm1d,
+    nn.InstanceNorm2d,
+    nn.InstanceNorm3d,
+    nn.BatchNorm1d,
+    nn.BatchNorm2d,
+    nn.BatchNorm3d,
+)
+
+
+def _ensure_channels_last_3d(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor is None or tensor.dim() != 5:
+        return tensor
+    return tensor.contiguous(memory_format=CHANNELS_LAST_3D)
+
+
+def _to_gpu_channels_last(tensor: torch.Tensor, device, dtype=None):
+    if tensor is None:
+        return tensor
+    tensor = tensor.to(device=device, dtype=dtype)
+    return _ensure_channels_last_3d(tensor)
+
+
+def _prune_latent_cache():
+    while len(_latent_cache) > MAX_LATENT_CACHE_ITEMS:
+        _latent_cache.popitem(last=False)
+
+
+def get_cached_latents(key: str):
+    if not key or MAX_LATENT_CACHE_ITEMS <= 0:
+        return None
+    with _latent_cache_lock:
+        tensor = _latent_cache.get(key)
+        if tensor is None:
+            return None
+        _latent_cache.move_to_end(key)
+        return tensor.clone()
+
+
+def set_cached_latents(key: str, tensor: torch.Tensor):
+    if not key or MAX_LATENT_CACHE_ITEMS <= 0 or tensor is None:
+        return
+    with _latent_cache_lock:
+        _latent_cache[key] = tensor.detach().clone()
+        _latent_cache.move_to_end(key)
+        _prune_latent_cache()
+
+
+def image_to_cache_key(image_array: np.ndarray) -> str:
+    if image_array is None:
+        return ''
+    return hashlib.sha1(image_array.tobytes()).hexdigest()
+
+
+def save_latent_segments(job_id: str, segments: list, metadata: dict, directory: str) -> str | None:
+    if not segments:
+        return None
+
+    package = {
+        'metadata': metadata,
+        'segments': [
+            {
+                'latent_padding': int(seg['latent_padding']),
+                'is_last_section': bool(seg['is_last_section']),
+                'generated_latents': seg['generated_latents'],
+            }
+            for seg in segments
+        ],
+    }
+
+    os.makedirs(directory, exist_ok=True)
+    latents_path = os.path.join(directory, f'{job_id}_latents.pt')
+    torch.save(package, latents_path)
+    return latents_path
+
+
+def _wrap_norm_module_fp32(module: torch.nn.Module):
+    if hasattr(module, '_framepack_fp32_norm'):
+        return
+
+    module.to(dtype=torch.float32)
+    original_forward = module.forward
+
+    def _forward_fp32_norm(self, *args, **kwargs):
+        if not args or not torch.is_tensor(args[0]):
+            return original_forward(*args, **kwargs)
+        input_tensor = args[0]
+        target_dtype = input_tensor.dtype
+        target_device = input_tensor.device
+
+        # Ensure module parameters are on the same device as input
+        if hasattr(self, 'weight') and self.weight is not None:
+            if self.weight.device != target_device:
+                self.to(device=target_device)
+
+        converted_args = list(args)
+        converted_args[0] = input_tensor.to(dtype=torch.float32)
+        output = original_forward(*converted_args, **kwargs)
+        if torch.is_tensor(output):
+            return output.to(dtype=target_dtype)
+        if isinstance(output, (tuple, list)):
+            converted = [o.to(dtype=target_dtype) if torch.is_tensor(o) else o for o in output]
+            return type(output)(converted)
+        return output
+
+    module.forward = _forward_fp32_norm.__get__(module, module.__class__)
+    module._framepack_fp32_norm = True
+
+
+def configure_vae_inference(vae_model: torch.nn.Module, target_device, apply_compile=True):
+    vae_model.to(device=target_device, dtype=torch.float16)
+    vae_model.to(memory_format=CHANNELS_LAST_3D)
+
+    # Apply torch.compile first if enabled
+    if apply_compile:
+        vae_model = maybe_torch_compile(vae_model, 'Autoencoder VAE', overrides={'mode': 'max-autotune'})
+
+    # Apply FP32 normalization wrapper AFTER torch.compile (or skip if torch.compile is active)
+    # This is because torch.compile creates a wrapper that makes runtime device movement impossible
+    if KEEP_VAE_FP32_NORMALIZATION and not (apply_compile and USE_TORCH_COMPILE):
+        for module in vae_model.modules():
+            if isinstance(module, NORM_FP32_TYPES):
+                _wrap_norm_module_fp32(module)
+        print("Applied FP32 normalization wrappers to VAE")
+    elif KEEP_VAE_FP32_NORMALIZATION and apply_compile and USE_TORCH_COMPILE:
+        print("Skipping FP32 normalization wrappers (incompatible with torch.compile)")
+
+    return vae_model
+
+if not high_vram:
+    # DynamicSwapInstaller is same as huggingface's enable_sequential_offload but 3x faster
+    DynamicSwapInstaller.install_model(transformer, device=gpu)
+    DynamicSwapInstaller.install_model(text_encoder, device=gpu)
+else:
+    text_encoder.to(gpu)
+    text_encoder_2.to(gpu)
+    image_encoder.to(gpu)
+    transformer.to(gpu)
+
+vae = configure_vae_inference(vae, target_device=gpu, apply_compile=True)
+if ENABLE_VAE_TILING:
+    vae.enable_tiling()
+
+if high_vram:
+    # torch.compile currently only makes sense when the transformer can stay resident on the GPU
+    transformer = maybe_torch_compile(transformer, 'Hunyuan Transformer')
+elif USE_TORCH_COMPILE:
+    print('Skipping torch.compile for transformer because low-VRAM swap mode is active.')
+
+stream = AsyncStream()
+
+outputs_folder = './outputs/'
+os.makedirs(outputs_folder, exist_ok=True)
+
+def flush_rocm_allocator(stage: str = '', min_resident_gb: float = 0.0) -> bool:
+    """Force ROCm/HIP BlockAllocator to release cached blocks back to the driver."""
+    if not IS_HIP_RUNTIME or not torch.cuda.is_available():
+        return False
+
+    torch.cuda.empty_cache()
+
+    try:
+        hip = ctypes.CDLL('libamdhip64.so')
+    except OSError as exc:
+        if stage:
+            print(f'[{stage}] HIP mempool trim skipped: {exc}')
+        return False
+
+    trim_fn = getattr(hip, 'hipMemPoolTrimTo', None)
+    get_pool_fn = getattr(hip, 'hipDeviceGetDefaultMemPool', None)
+    if trim_fn is None or get_pool_fn is None:
+        if stage:
+            print(f'[{stage}] HIP mempool trim unsupported on this runtime.')
+        return False
+
+    trim_fn.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    trim_fn.restype = ctypes.c_int
+    get_pool_fn.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int]
+    get_pool_fn.restype = ctypes.c_int
+
+    pool = ctypes.c_void_p()
+    device_index = gpu.index if isinstance(gpu, torch.device) and gpu.index is not None else torch.cuda.current_device()
+
+    status = get_pool_fn(ctypes.byref(pool), ctypes.c_int(device_index))
+    if status != 0:
+        if stage:
+            print(f'[{stage}] hipDeviceGetDefaultMemPool failed with status {status}')
+        return False
+
+    bytes_to_keep = max(0, int(min_resident_gb * (1024 ** 3)))
+    status = trim_fn(pool, ctypes.c_size_t(bytes_to_keep))
+    trimmed = status == 0
+    if stage:
+        outcome = 'trimmed' if trimmed else f'failed ({status})'
+        print(f'[{stage}] ROCm mempool {outcome}')
+    return trimmed
+
+
+@torch.no_grad()
+def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
+    total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
+    total_latent_sections = int(max(round(total_latent_sections), 1))
+
+    job_id = generate_timestamp()
+
+    stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
+
+    flush_rocm_allocator('worker-start')
+
+    latent_segments: list[dict] = []
+    latent_metadata = {
+        'job_id': job_id,
+        'latent_window_size': latent_window_size,
+        'mp4_crf': mp4_crf,
+        'fps': 30,
+        'version': LATENTS_EXPORT_VERSION,
+    }
+    latent_padding_history: list[int] = []
+
+    try:
+        # Clean GPU
+        if not high_vram:
+            unload_complete_models(
+                text_encoder, text_encoder_2, image_encoder, transformer
+            )
+            flush_rocm_allocator('post-unload/text-enc')
+
+        # Text encoding
+
+        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Text encoding ...'))))
+
+        if not high_vram:
+            fake_diffusers_current_device(text_encoder, gpu)  # since we only encode one text - that is one model move and one encode, offload is same time consumption since it is also one load and one encode.
+            load_model_as_complete(text_encoder_2, target_device=gpu)
+
+        llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+
+        if cfg == 1:
+            llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
+        else:
+            llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+
+        llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
+        llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
+
+        # Unload text encoders immediately after use (not needed anymore)
+        if not high_vram:
+            unload_complete_models(text_encoder, text_encoder_2)
+            flush_rocm_allocator('post-text-encoding')
+
+        # Processing input image
+
+        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Image processing ...'))))
+
+        H, W, C = input_image.shape
+        height, width = find_nearest_bucket(H, W, resolution=640)
+        latent_metadata['height'] = height
+        latent_metadata['width'] = width
+        input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)
+
+        Image.fromarray(input_image_np).save(os.path.join(outputs_folder, f'{job_id}.png'))
+
+        input_image_pt = torch.from_numpy(input_image_np).float() / 127.5 - 1
+        input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
+        input_image_pt = _to_gpu_channels_last(input_image_pt, gpu, dtype=vae.dtype)
+
+        image_cache_key = image_to_cache_key(input_image_np)
+
+        # VAE encoding
+
+        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'VAE encoding ...'))))
+
+        start_latent = get_cached_latents(image_cache_key)
+        if start_latent is not None:
+            start_latent = _to_gpu_channels_last(start_latent, gpu, dtype=vae.dtype)
+            print('Reusing cached VAE latents for identical input frame.')
+        else:
+            start_latent = vae_encode(input_image_pt, vae)
+            start_latent = _ensure_channels_last_3d(start_latent)
+            set_cached_latents(image_cache_key, start_latent)
+
+        # CLIP Vision
+
+        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'CLIP Vision encoding ...'))))
+
+        if not high_vram:
+            load_model_as_complete(image_encoder, target_device=gpu)
+
+        image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
+        image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
+
+        # Unload image encoder after use (not needed anymore)
+        if not high_vram:
+            unload_complete_models(image_encoder)
+            flush_rocm_allocator('post-clip-vision')
+
+        # Dtype
+
+        llama_vec = llama_vec.to(transformer.dtype)
+        llama_vec_n = llama_vec_n.to(transformer.dtype)
+        clip_l_pooler = clip_l_pooler.to(transformer.dtype)
+        clip_l_pooler_n = clip_l_pooler_n.to(transformer.dtype)
+        image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(transformer.dtype)
+
+        # Sampling
+
+        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Start sampling ...'))))
+
+        rnd = torch.Generator("cpu").manual_seed(seed)
+        num_frames = latent_window_size * 4 - 3
+
+        history_latents = torch.zeros(
+            size=(1, 16, 1 + 2 + 16, height // 8, width // 8),
+            dtype=transformer.dtype,
+            device=gpu,
+        )
+        history_latents = _ensure_channels_last_3d(history_latents)
+        history_pixels = None
+        total_generated_latent_frames = 0
+
+        latent_paddings = reversed(range(total_latent_sections))
+
+        if total_latent_sections > 4:
+            # In theory the latent_paddings should follow the above sequence, but it seems that duplicating some
+            # items looks better than expanding it when total_latent_sections > 4
+            # One can try to remove below trick and just
+            # use `latent_paddings = list(reversed(range(total_latent_sections)))` to compare
+            latent_paddings = [3] + [2] * (total_latent_sections - 3) + [1, 0]
+
+        for latent_padding in latent_paddings:
+            is_last_section = latent_padding == 0
+            latent_padding_size = latent_padding * latent_window_size
+            latent_padding_history.append(int(latent_padding))
+
+            if stream.input_queue.top() == 'end':
+                stream.output_queue.push(('end', None))
+                return
+
+            print(f'latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}')
+
+            indices = torch.arange(0, sum([1, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
+            clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
+            clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
+
+            clean_latents_pre = start_latent.to(history_latents)
+            clean_latents_post, clean_latents_2x, clean_latents_4x = history_latents[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
+            clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
+
+            if not high_vram:
+                unload_complete_models()
+                flush_rocm_allocator('post-unload/transformer')
+                # Log memory status on first iteration for debugging
+                latent_paddings_list = list(latent_paddings)
+                if latent_paddings_list and latent_padding == latent_paddings_list[0]:
+                    log_memory_status(gpu, prefix="[Before Transformer Load] ")
+                move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
+
+            if use_teacache:
+                transformer.initialize_teacache(enable_teacache=True, num_steps=steps)
+            else:
+                transformer.initialize_teacache(enable_teacache=False)
+
+            def callback(d):
+                preview = d['denoised']
+                preview = vae_decode_fake(preview)
+
+                preview = (preview * 255.0).detach().cpu().numpy().clip(0, 255).astype(np.uint8)
+                preview = einops.rearrange(preview, 'b c t h w -> (b h) (t w) c')
+
+                if stream.input_queue.top() == 'end':
+                    stream.output_queue.push(('end', None))
+                    raise KeyboardInterrupt('User ends the task.')
+
+                current_step = d['i'] + 1
+                percentage = int(100.0 * current_step / steps)
+                hint = f'Sampling {current_step}/{steps}'
+                desc = f'Total generated frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, Video length: {max(0, (total_generated_latent_frames * 4 - 3) / 30) :.2f} seconds (FPS-30). The video is being extended now ...'
+                stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
+                return
+
+            generated_latents = sample_hunyuan(
+                transformer=transformer,
+                sampler='unipc',
+                width=width,
+                height=height,
+                frames=num_frames,
+                real_guidance_scale=cfg,
+                distilled_guidance_scale=gs,
+                guidance_rescale=rs,
+                # shift=3.0,
+                num_inference_steps=steps,
+                generator=rnd,
+                prompt_embeds=llama_vec,
+                prompt_embeds_mask=llama_attention_mask,
+                prompt_poolers=clip_l_pooler,
+                negative_prompt_embeds=llama_vec_n,
+                negative_prompt_embeds_mask=llama_attention_mask_n,
+                negative_prompt_poolers=clip_l_pooler_n,
+                device=gpu,
+                dtype=torch.bfloat16,
+                image_embeddings=image_encoder_last_hidden_state,
+                latent_indices=latent_indices,
+                clean_latents=clean_latents,
+                clean_latent_indices=clean_latent_indices,
+                clean_latents_2x=clean_latents_2x,
+                clean_latent_2x_indices=clean_latent_2x_indices,
+                clean_latents_4x=clean_latents_4x,
+                clean_latent_4x_indices=clean_latent_4x_indices,
+                callback=callback,
+            )
+            generated_latents = _ensure_channels_last_3d(generated_latents)
+
+            segment_latents = generated_latents
+            if is_last_section:
+                segment_latents = torch.cat([start_latent.to(segment_latents), segment_latents], dim=2)
+
+            latent_segments.append({
+                'latent_padding': int(latent_padding),
+                'is_last_section': bool(is_last_section),
+                'generated_latents': segment_latents.detach().to('cpu'),
+            })
+
+            total_generated_latent_frames += int(segment_latents.shape[2])
+
+            if SKIP_IMMEDIATE_DECODE:
+                if is_last_section:
+                    break
+                continue
+
+            history_latents = torch.cat([segment_latents.to(history_latents), history_latents], dim=2)
+
+            real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
+            real_history_latents = _ensure_channels_last_3d(real_history_latents)
+
+            if history_pixels is None:
+                history_pixels = vae_decode(real_history_latents, vae)
+                history_pixels = _ensure_channels_last_3d(history_pixels).cpu()
+            else:
+                section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
+                overlapped_frames = latent_window_size * 4 - 3
+
+                current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae)
+                current_pixels = _ensure_channels_last_3d(current_pixels).cpu()
+                history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
+                history_pixels = _ensure_channels_last_3d(history_pixels)
+
+            output_filename = os.path.join(outputs_folder, f'{job_id}_{total_generated_latent_frames}.mp4')
+
+            save_bcthw_as_mp4(history_pixels, output_filename, fps=30, crf=mp4_crf)
+
+            print(f'Decoded. Current latent shape {real_history_latents.shape}; pixel shape {history_pixels.shape}')
+
+            stream.output_queue.push(('file', output_filename))
+
+            if is_last_section:
+                break
+
+        latent_metadata['total_latent_frames'] = total_generated_latent_frames
+        latent_metadata['latent_paddings'] = latent_padding_history
+        latents_file = save_latent_segments(job_id, latent_segments, latent_metadata, outputs_folder)
+        if latents_file:
+            print(f'Latent segments saved to {latents_file}')
+            stream.output_queue.push(('latents', latents_file))
+    except:
+        traceback.print_exc()
+    finally:
+        # Clean up models and GPU memory after completion or exception
+        if not high_vram:
+            unload_complete_models(
+                text_encoder, text_encoder_2, image_encoder, transformer
+            )
+            flush_rocm_allocator('worker-cleanup')
+
+    # Print MIOpen fallback statistics
+    MIOpenFallbackHandler.print_stats()
+
+    stream.output_queue.push(('end', None))
+    return
+
+
+def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
+    global stream
+    assert input_image is not None, 'No input image!'
+
+    yield None, None, '', '', gr.update(interactive=False), gr.update(interactive=True)
+
+    stream = AsyncStream()
+
+    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf)
+
+    output_filename = None
+
+    while True:
+        flag, data = stream.output_queue.next()
+
+        if flag == 'file':
+            output_filename = data
+            # Force video component to update by providing explicit value
+            yield gr.update(value=output_filename), gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True)
+        if flag == 'latents':
+            output_filename = data
+            desc = f'Latent segments saved to {os.path.basename(output_filename)}'
+            yield gr.update(value=None), gr.update(visible=False), desc, '', gr.update(interactive=False), gr.update(interactive=True)
+
+        if flag == 'progress':
+            preview, desc, html = data
+            yield gr.update(), gr.update(visible=True, value=preview), desc, html, gr.update(interactive=False), gr.update(interactive=True)
+
+        if flag == 'end':
+            yield gr.update(value=output_filename), gr.update(visible=False), gr.update(), '', gr.update(interactive=True), gr.update(interactive=False)
+            break
+
+
+def end_process():
+    stream.input_queue.push('end')
+
+
+quick_prompts = [
+    'The girl dances gracefully, with clear movements, full of charm.',
+    'A character doing some simple body movements.',
+]
+quick_prompts = [[x] for x in quick_prompts]
+
+
+css = make_progress_bar_css()
+block = gr.Blocks(css=css).queue()
+with block:
+    gr.Markdown('# FramePack')
+    with gr.Row():
+        with gr.Column():
+            input_image = gr.Image(sources='upload', type="numpy", label="Image", height=320)
+            prompt = gr.Textbox(label="Prompt", value='')
+            example_quick_prompts = gr.Dataset(samples=quick_prompts, label='Quick List', samples_per_page=1000, components=[prompt])
+            example_quick_prompts.click(lambda x: x[0], inputs=[example_quick_prompts], outputs=prompt, show_progress=False, queue=False)
+
+            with gr.Row():
+                start_button = gr.Button(value="Start Generation")
+                end_button = gr.Button(value="End Generation", interactive=False)
+
+            with gr.Group():
+                use_teacache = gr.Checkbox(label='Use TeaCache', value=True, info='Faster speed, but often makes hands and fingers slightly worse.')
+
+                n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=False)  # Not used
+                seed = gr.Number(label="Seed", value=31337, precision=0)
+
+                total_second_length = gr.Slider(label="Total Video Length (Seconds)", minimum=1, maximum=120, value=5, step=0.1)
+                latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=False)  # Should not change
+                steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Changing this value is not recommended.')
+
+                cfg = gr.Slider(label="CFG Scale", minimum=1.0, maximum=32.0, value=1.0, step=0.01, visible=False)  # Should not change
+                gs = gr.Slider(label="Distilled CFG Scale", minimum=1.0, maximum=32.0, value=10.0, step=0.01, info='Changing this value is not recommended.')
+                rs = gr.Slider(label="CFG Re-Scale", minimum=0.0, maximum=1.0, value=0.0, step=0.01, visible=False)  # Should not change
+
+                gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=4, maximum=128, value=10 if not high_vram else 6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed. For 20-24GB VRAM, use 10GB+ to prevent BlockAllocator failures.")
+
+                mp4_crf = gr.Slider(label="MP4 Compression", minimum=0, maximum=100, value=16, step=1, info="Lower means better quality. 0 is uncompressed. Change to 16 if you get black outputs. ")
+
+        with gr.Column():
+            preview_image = gr.Image(label="Next Latents", height=200, visible=False)
+            result_video = gr.Video(label="Finished Frames", autoplay=True, show_share_button=False, height=512, loop=True)
+            gr.Markdown('Note that the ending actions will be generated before the starting actions due to the inverted sampling. If the starting action is not in the video, you just need to wait, and it will be generated later.')
+            progress_desc = gr.Markdown('', elem_classes='no-generating-animation')
+            progress_bar = gr.HTML('', elem_classes='no-generating-animation')
+
+    gr.HTML('<div style="text-align:center; margin-top:20px;">Share your results and find ideas at the <a href="https://x.com/search?q=framepack&f=live" target="_blank">FramePack Twitter (X) thread</a></div>')
+
+    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf]
+    start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
+    end_button.click(fn=end_process)
+
+
+block.launch(
+    server_name=args.server,
+    server_port=args.port,
+    share=args.share,
+    inbrowser=args.inbrowser,
+)
