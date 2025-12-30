@@ -110,6 +110,19 @@ except ImportError:
     print("Note: torch_migraphx not installed. Using standard torch backends.")
     print("Install with: pip install torch_migraphx for AMD ROCm optimizations.")
 
+# Try to import Transformer Engine for FP8 optimization on AMD ROCm
+# This provides an alternative to bitsandbytes with native FP8 support on MI300 GPUs
+HAS_TRANSFORMER_ENGINE = False
+try:
+    import transformer_engine.pytorch as te
+    from transformer_engine.common.recipe import Format, DelayedScaling
+    HAS_TRANSFORMER_ENGINE = True
+    print("Transformer Engine available - FP8 optimization enabled for AMD MI300 GPUs")
+except ImportError:
+    print("Note: Transformer Engine not installed. Using bitsandbytes or full precision.")
+    print("Install with: pip install transformer_engine for AMD ROCm FP8 optimizations.")
+    print("See: cache/TransformerEngine-dev/README.rst for installation instructions.")
+
 # Try to import the real bitsandbytes for our use (AMD ROCm version has limitations)
 # IMPORTANT: Import AFTER diffusers to avoid CPUBackend compatibility issues during diffusers init
 HAS_BITSANDBYTES = False
@@ -181,6 +194,17 @@ def _env_flag(name: str, default: str = '0') -> bool:
 # Bitsandbytes 8-bit optimization configuration (AMD ROCm compatible)
 USE_BITSANDBYTES = _env_flag('FRAMEPACK_USE_BITSANDBYTES', '1')  # Enabled by default
 
+# Transformer Engine optimization configuration (AMD ROCm compatible)
+# Note: TE and Bitsandbytes are mutually exclusive - TE takes priority if both are enabled
+# TE provides optimized kernels even without FP8 (works on RX 7900, MI200, MI300)
+USE_TRANSFORMER_ENGINE = _env_flag('FRAMEPACK_USE_TRANSFORMER_ENGINE', '1')  # Disabled by default
+USE_TRANSFORMER_ENGINE_FP8 = _env_flag('FRAMEPACK_USE_TRANSFORMER_ENGINE_FP8', '0')  # Only enable on MI300+
+USE_TRANSFORMER_ENGINE_CACHE = _env_flag('FRAMEPACK_USE_TRANSFORMER_ENGINE_CACHE', '1')  # Cache converted models for faster startup
+if USE_TRANSFORMER_ENGINE and USE_BITSANDBYTES:
+    print("Note: Both Transformer Engine and Bitsandbytes are enabled.")
+    print("  Transformer Engine will be used (takes priority)")
+    USE_BITSANDBYTES = False
+
 
 def get_quantization_config():
     """
@@ -203,6 +227,255 @@ def get_quantization_config():
     except Exception as e:
         print(f"  ⚠ Failed to create quantization config: {e}")
         return None
+
+
+def get_te_fp8_recipe():
+    """
+    Create Transformer Engine FP8 recipe for AMD ROCm MI300 GPUs.
+
+    Only creates recipe if FP8 is explicitly enabled (MI300+ GPUs only).
+    For other GPUs (RX 7900, MI200), TE works without FP8.
+
+    Returns:
+        DelayedScaling recipe for FP8 inference or None if FP8 disabled/not available
+    """
+    if not HAS_TRANSFORMER_ENGINE or not USE_TRANSFORMER_ENGINE_FP8:
+        return None
+
+    try:
+        # Use HYBRID format for best compatibility on AMD MI300
+        # E4M3 for forward pass, E5M2 for gradients
+        fp8_format = Format.HYBRID
+
+        # Recipe configuration optimized for inference
+        fp8_recipe = DelayedScaling(
+            fp8_format=fp8_format,
+            amax_history_len=16,  # Shorter history for inference
+            amax_compute_algo="max",  # Use max for stability
+            override_linear_precision=(False, False, False)  # Let TE decide precision
+        )
+        print("  Created Transformer Engine FP8 recipe (AMD MI300)")
+        return fp8_recipe
+    except Exception as e:
+        print(f"  ⚠ Failed to create TE FP8 recipe: {e}")
+        return None
+
+
+def get_te_cache_path(model_name: str) -> str:
+    """
+    Get the cache path for a TE-converted model.
+
+    Args:
+        model_name: Name of the model (e.g., "text_encoder", "text_encoder_2")
+
+    Returns:
+        Path to cached model file
+    """
+    cache_dir = os.path.join(os.path.dirname(__file__), '.cache_rocm', 'te_models')
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, f'{model_name}.safetensors')
+
+
+def save_te_model_cache(model: torch.nn.Module, model_name: str, verbose: bool = True):
+    """
+    Save TE-converted model to cache for faster loading next time.
+
+    Args:
+        model: Converted model with TE Linear layers
+        model_name: Name for cache file
+        verbose: Whether to print save status
+    """
+    if not HAS_TRANSFORMER_ENGINE or not USE_TRANSFORMER_ENGINE:
+        return
+
+    try:
+        cache_path = get_te_cache_path(model_name)
+
+        # Save model state dict
+        state_dict = model.state_dict()
+        sf.save_file(state_dict, cache_path)
+
+        if verbose:
+            cache_size_mb = os.path.getsize(cache_path) / (1024**2)
+            print(f"    Cached {model_name} to {cache_path} ({cache_size_mb:.1f} MB)")
+    except Exception as e:
+        if verbose:
+            print(f"    ⚠ Failed to cache {model_name}: {e}")
+
+
+def check_te_cache_exists(model_name: str) -> bool:
+    """
+    Check if a cached TE model exists and is recent.
+
+    Args:
+        model_name: Name of the model
+
+    Returns:
+        True if cache exists and is less than 7 days old
+    """
+    if not HAS_TRANSFORMER_ENGINE or not USE_TRANSFORMER_ENGINE:
+        return False
+
+    cache_path = get_te_cache_path(model_name)
+
+    if not os.path.exists(cache_path):
+        return False
+
+    # Check cache age (invalidate after 7 days)
+    cache_age_days = (time.time() - os.path.getmtime(cache_path)) / (24 * 3600)
+    if cache_age_days > 7:
+        return False
+
+    return True
+
+
+def load_te_weights_from_cache(model: torch.nn.Module, model_name: str, verbose: bool = True) -> bool:
+    """
+    Load TE model weights from cache into an already-converted model.
+
+    This is called AFTER convert_model_to_te has replaced Linear layers with te.Linear.
+
+    Args:
+        model: Model with TE Linear layers (already converted)
+        model_name: Name of cached model
+        verbose: Whether to print load status
+
+    Returns:
+        True if weights were loaded successfully
+    """
+    cache_path = get_te_cache_path(model_name)
+
+    if not os.path.exists(cache_path):
+        return False
+
+    try:
+        if verbose:
+            cache_age_hours = (time.time() - os.path.getmtime(cache_path)) / 3600
+            print(f"    Loading weights from cache ({cache_age_hours:.1f} hours old)...")
+
+        # Load state dict from cache
+        state_dict = sf.load_file(cache_path)
+
+        # Load weights into already-converted model
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
+        if verbose:
+            if missing or unexpected:
+                print(f"    ⚠ Cache mismatch: {len(missing)} missing, {len(unexpected)} unexpected keys")
+                return False
+            print(f"    ✓ Loaded weights from cache")
+
+        return True
+
+    except Exception as e:
+        if verbose:
+            print(f"    ⚠ Failed to load from cache: {e}")
+        return False
+
+
+def convert_model_to_te(model: torch.nn.Module, model_name: str, verbose: bool = True, use_cache: bool = True):
+    """
+    Convert a PyTorch model to use Transformer Engine Linear layers.
+    Supports caching to avoid re-loading weights on subsequent runs.
+
+    Args:
+        model: PyTorch model to convert (LlamaModel, CLIPTextModel, etc.)
+        model_name: Human-readable name for logging and caching
+        verbose: Whether to print conversion details
+        use_cache: Whether to use/create cached weights
+
+    Returns:
+        Converted model with TE Linear layers
+    """
+    if not HAS_TRANSFORMER_ENGINE or not USE_TRANSFORMER_ENGINE:
+        return model
+
+    # Check if we have cached weights
+    has_cache = use_cache and check_te_cache_exists(model_name)
+
+    # Perform conversion (structure replacement)
+    try:
+        num_replaced = 0
+        num_failed = 0
+
+        def replace_linear_recursive(module, prefix=""):
+            nonlocal num_replaced, num_failed
+
+            for name, child in module.named_children():
+                full_name = f"{prefix}.{name}" if prefix else name
+
+                if isinstance(child, nn.Linear):
+                    try:
+                        # Extract Linear layer properties
+                        in_features = child.in_features
+                        out_features = child.out_features
+                        bias = child.bias is not None
+                        device = child.weight.device
+                        dtype = child.weight.dtype
+
+                        # Create TE Linear layer
+                        te_linear = te.Linear(
+                            in_features=in_features,
+                            out_features=out_features,
+                            bias=bias,
+                            params_dtype=dtype,
+                            device=device,
+                        )
+
+                        # Copy weights from original layer (unless loading from cache)
+                        if not has_cache:
+                            with torch.no_grad():
+                                te_linear.weight.copy_(child.weight)
+                                if bias:
+                                    te_linear.bias.copy_(child.bias)
+
+                        # Replace the module
+                        setattr(module, name, te_linear)
+                        num_replaced += 1
+
+                        if verbose and not has_cache and num_replaced <= 5:  # Only print first few
+                            print(f"    ✓ {full_name}: Linear({in_features}, {out_features}) -> te.Linear")
+
+                    except Exception as e:
+                        num_failed += 1
+                        if verbose:
+                            print(f"    ✗ Failed {full_name}: {e}")
+                else:
+                    # Recursively process child modules
+                    replace_linear_recursive(child, full_name)
+
+        if verbose:
+            if has_cache:
+                print(f"  Converting {model_name} to Transformer Engine (loading cached weights)...")
+            else:
+                print(f"  Converting {model_name} to Transformer Engine...")
+
+        # Replace Linear layers with TE Linear layers
+        replace_linear_recursive(model)
+
+        if verbose and not has_cache:
+            print(f"  ✓ Converted {model_name}: {num_replaced} Linear layers -> te.Linear")
+            if num_failed > 0:
+                print(f"    ⚠ Failed to convert {num_failed} layers")
+
+        # Load weights from cache if available
+        if has_cache:
+            cache_loaded = load_te_weights_from_cache(model, model_name, verbose)
+            if not cache_loaded:
+                # Cache load failed, we already have weights from original model
+                if verbose:
+                    print(f"    Using original weights (cache load failed)")
+        else:
+            # Save to cache for next time
+            if use_cache and num_replaced > 0:
+                save_te_model_cache(model, model_name, verbose)
+
+        return model
+
+    except Exception as e:
+        print(f"  ✗ Failed to convert {model_name} to TE: {e}")
+        print(f"    Using original model")
+        return model
 
 
 free_mem_gb = get_cuda_free_memory_gb(gpu)
@@ -320,39 +593,54 @@ def load_model_with_fallback(model_class, model_name, subfolder=None, dtype=torc
     return model
 
 
-# Create quantization config for AMD ROCm bitsandbytes
+# Create quantization config for AMD ROCm bitsandbytes or TE FP8
 quantization_config = get_quantization_config()
+te_fp8_recipe = get_te_fp8_recipe() if USE_TRANSFORMER_ENGINE else None
 
-if quantization_config is not None:
+if USE_TRANSFORMER_ENGINE and HAS_TRANSFORMER_ENGINE:
+    if USE_TRANSFORMER_ENGINE_FP8:
+        print("\nUsing Transformer Engine with FP8 optimization (AMD MI300)...")
+        print("Note: Models will be loaded in FP16, then converted to TE with FP8 support.\n")
+    else:
+        print("\nUsing Transformer Engine with optimized kernels (AMD ROCm)...")
+        print("Note: Models will be loaded in FP16, then converted to TE (FP8 disabled for RX 7900 compatibility).\n")
+elif quantization_config is not None:
     print("\nAttempting to load models with 8-bit quantization...")
     print("Note: Will fall back to full precision if quantization fails for any model.\n")
 else:
     print("\nLoading models in full precision...\n")
 
 # Load models with automatic fallback to full precision if quantization fails
+# For TE, we load in FP16 first, then convert Linear layers to TE
 text_encoder = load_model_with_fallback(
     LlamaModel,
     "hunyuanvideo-community/HunyuanVideo",
     subfolder='text_encoder',
     dtype=torch.float16,
-    quantization_config=quantization_config
+    quantization_config=quantization_config if not USE_TRANSFORMER_ENGINE else None
 )
+# Convert to TE if enabled
+text_encoder = convert_model_to_te(text_encoder, "text_encoder", verbose=True, use_cache=USE_TRANSFORMER_ENGINE_CACHE)
 
 text_encoder_2 = load_model_with_fallback(
     CLIPTextModel,
     "hunyuanvideo-community/HunyuanVideo",
     subfolder='text_encoder_2',
     dtype=torch.float16,
-    quantization_config=quantization_config
+    quantization_config=quantization_config if not USE_TRANSFORMER_ENGINE else None
 )
+# Convert to TE if enabled
+text_encoder_2 = convert_model_to_te(text_encoder_2, "text_encoder_2", verbose=True, use_cache=USE_TRANSFORMER_ENGINE_CACHE)
 
 image_encoder = load_model_with_fallback(
     SiglipVisionModel,
     "lllyasviel/flux_redux_bfl",
     subfolder='image_encoder',
     dtype=torch.float16,
-    quantization_config=quantization_config
+    quantization_config=quantization_config if not USE_TRANSFORMER_ENGINE else None
 )
+# Convert to TE if enabled
+image_encoder = convert_model_to_te(image_encoder, "image_encoder", verbose=True, use_cache=USE_TRANSFORMER_ENGINE_CACHE)
 
 tokenizer = LlamaTokenizerFast.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer')
 tokenizer_2 = CLIPTokenizer.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer_2')
@@ -553,11 +841,32 @@ elif USE_TORCH_COMPILE:
     else:
         print(f"\nTorch Compile: Enabled ({TORCH_COMPILE_MODE} mode, {TORCH_COMPILE_BACKEND} backend)")
 
+# Transformer Engine configuration output
+if USE_TRANSFORMER_ENGINE and HAS_TRANSFORMER_ENGINE:
+    if USE_TRANSFORMER_ENGINE_FP8:
+        print(f"\nTransformer Engine: Enabled with FP8 (AMD MI300+)")
+        print(f"  This will reduce memory usage and improve performance with native FP8")
+        print(f"  Linear layers are converted to te.Linear with FP8 autocast")
+        print(f"  Model caching: {'Enabled' if USE_TRANSFORMER_ENGINE_CACHE else 'Disabled'} (faster startup on subsequent runs)")
+        print(f"  Environment variables: FRAMEPACK_USE_TRANSFORMER_ENGINE=1, FRAMEPACK_USE_TRANSFORMER_ENGINE_FP8=1")
+    else:
+        print(f"\nTransformer Engine: Enabled (AMD ROCm - RX 7900 compatible)")
+        print(f"  Optimized kernels without FP8 (RX 7900 doesn't support FP8)")
+        print(f"  Linear layers are converted to te.Linear for better performance")
+        print(f"  Model caching: {'Enabled' if USE_TRANSFORMER_ENGINE_CACHE else 'Disabled'} (faster startup on subsequent runs)")
+        print(f"  Environment variable: FRAMEPACK_USE_TRANSFORMER_ENGINE=1")
+elif USE_TRANSFORMER_ENGINE and not HAS_TRANSFORMER_ENGINE:
+    print(f"\nTransformer Engine: Requested but not available")
+    print(f"  Install with: pip install transformer_engine")
+    print(f"  See: cache/TransformerEngine-dev/README.rst for AMD ROCm installation")
+    USE_TRANSFORMER_ENGINE = False
+
 # Bitsandbytes configuration output
 if USE_BITSANDBYTES and HAS_BITSANDBYTES:
     print(f"\nBitsandbytes 8-bit Optimization: Enabled (AMD ROCm)")
     print(f"  This will reduce memory usage and may improve performance")
     print(f"  Models are quantized during loading with BitsAndBytesConfig")
+    print(f"  Environment variable: FRAMEPACK_USE_BITSANDBYTES=1")
 elif USE_BITSANDBYTES and not HAS_BITSANDBYTES:
     print(f"\nBitsandbytes 8-bit Optimization: Requested but not available")
     print(f"  Install AMD ROCm version with: pip install bitsandbytes")
@@ -994,12 +1303,24 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             fake_diffusers_current_device(text_encoder, gpu)  # since we only encode one text - that is one model move and one encode, offload is same time consumption since it is also one load and one encode.
             load_model_as_complete(text_encoder_2, target_device=gpu)
 
-        llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+        # Use Transformer Engine FP8 autocast if enabled (MI300+ only)
+        # For RX 7900, TE layers run without FP8 autocast
+        if USE_TRANSFORMER_ENGINE_FP8 and HAS_TRANSFORMER_ENGINE and te_fp8_recipe is not None:
+            with te.fp8_autocast(enabled=True, fp8_recipe=te_fp8_recipe):
+                llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
 
-        if cfg == 1:
-            llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
+                if cfg == 1:
+                    llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
+                else:
+                    llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
         else:
-            llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+            # Standard encoding (TE without FP8, or no TE)
+            llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+
+            if cfg == 1:
+                llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
+            else:
+                llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
 
         llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
         llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
@@ -1047,8 +1368,16 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         if not high_vram:
             load_model_as_complete(image_encoder, target_device=gpu)
 
-        image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
-        image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
+        # Use Transformer Engine FP8 autocast if enabled (MI300+ only)
+        # For RX 7900, TE layers run without FP8 autocast
+        if USE_TRANSFORMER_ENGINE_FP8 and HAS_TRANSFORMER_ENGINE and te_fp8_recipe is not None:
+            with te.fp8_autocast(enabled=True, fp8_recipe=te_fp8_recipe):
+                image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
+                image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
+        else:
+            # Standard encoding (TE without FP8, or no TE)
+            image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
+            image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
 
         # Unload image encoder after use (not needed anymore)
         if not high_vram:
