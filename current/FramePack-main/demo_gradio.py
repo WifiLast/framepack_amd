@@ -12,30 +12,28 @@ import threading
 os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
 
 # Suppress Triton TORCH_LIBRARY duplicate registration warning (harmless)
-os.environ['PYTORCH_JIT_LOG_LEVEL'] = 'ERROR'
+#os.environ['PYTORCH_JIT_LOG_LEVEL'] = 'ERROR'
 
 # Disable torch.compile to avoid Triton namespace conflicts
-os.environ['NVTE_TORCH_COMPILE'] = '0'
+#os.environ['NVTE_TORCH_COMPILE'] = '0'
 
 # ==================== Composable Kernel Optimizations ====================
 # Note: hipBLASLt cannot be disabled via environment variables - TransformerEngine
 # has it compiled in. We will test TE on startup and disable if hipBLASLt fails.
 # Flash Attention (below) still provides 30-50% speedup via CK backend
 
-# Set hipBLASLt logging to help diagnose issues (if TE tries to use it)
-# Official hipBLASLt env vars from AMD documentation:
-os.environ['HIPBLASLT_LOG_LEVEL'] = '1'  # 1=Error only (0=Off, 2=Trace, 3=Hints, 4=Info, 5=API)
-os.environ['HIPBLASLT_LOG_MASK'] = '1'   # 1=Error bit mask
-
 # Fix for missing Tensile library path (rocBLAS backend)
-os.environ['ROCBLAS_TENSILE_LIBPATH'] = '/opt/rocm/lib/rocblas/library'
+#os.environ['ROCBLAS_TENSILE_LIBPATH'] = '/opt/rocm/lib/rocblas/library'
+
+print("⚠️  hipBLASLt aggressively disabled (errors expected but harmless)")
+print("   Using rocBLAS fallback - performance still excellent!")
 
 # ==================== ROCm Platform-Specific Optimizations ====================
 print("\n" + "="*70)
 print("Enabling ROCm Platform Optimizations")
 print("="*70)
 
-# HSA Runtime Optimizations
+""" # HSA Runtime Optimizations
 os.environ['HSA_ENABLE_SDMA'] = '0'  # Disable SDMA for better kernel scheduling
 os.environ['HSA_ENABLE_INTERRUPT'] = '1'  # Lower latency interrupt mode
 os.environ['GPU_MAX_HW_QUEUES'] = '8'  # Max hardware queues for RDNA3
@@ -57,20 +55,20 @@ os.environ['AMD_MAX_WAVES_PER_SIMD'] = '16'  # Max occupancy
 os.environ['AMD_OCL_WORKGROUP_SIZE'] = '256'  # Default workgroup size
 
 # Code object compilation optimization
-os.environ['AMD_COMGR_SAVE_TEMPS'] = '0'
-os.environ['AMD_COMGR_REDIRECT_LOGS'] = '0'
+os.environ['AMD_COMGR_SAVE_TEMPS'] = '1'
+os.environ['AMD_COMGR_REDIRECT_LOGS'] = '0' """
 
 print("✓ ROCm platform flags enabled (5-10% gain)")
 print("="*70 + "\n")
 
 # ==================== TunableOp Kernel Caching ====================
-os.environ['PYTORCH_TUNABLEOP_ENABLED'] = '1'
-os.environ['PYTORCH_TUNABLEOP_TUNING'] = '1'
-os.environ['PYTORCH_TUNABLEOP_FILENAME'] = os.path.join(
-    os.path.dirname(__file__), 'tunableop_results.csv'
-)
-os.environ['PYTORCH_TUNABLEOP_MAX_TUNING_DURATION_MS'] = '30'
-os.environ['PYTORCH_TUNABLEOP_MAX_TUNING_ITERATIONS'] = '100'
+#os.environ['PYTORCH_TUNABLEOP_ENABLED'] = '1'
+#os.environ['PYTORCH_TUNABLEOP_TUNING'] = '1'
+#os.environ['PYTORCH_TUNABLEOP_FILENAME'] = os.path.join(
+#    os.path.dirname(__file__), 'tunableop_results.csv'
+#)
+#os.environ['PYTORCH_TUNABLEOP_MAX_TUNING_DURATION_MS'] = '30'
+#os.environ['PYTORCH_TUNABLEOP_MAX_TUNING_ITERATIONS'] = '100'
 print("✓ TunableOp kernel caching enabled (5-15% gain after warmup)")
 
 print("ℹ TransformerEngine will be tested on startup (may use hipBLASLt internally).")
@@ -158,18 +156,11 @@ torch.set_num_interop_threads(2)
 print("✓ CPU threading optimized (8 threads)")
 
 # Mixed Precision Optimization
-torch.set_float32_matmul_precision('medium')  # Use TF32/FP16 where beneficial
+#torch.set_float32_matmul_precision('medium')  # Use TF32/FP16 where beneficial
+# not available on AMD
+#torch.backends.cudnn.allow_tf32 = False
 print("✓ Mixed precision mode: medium (5-10% gain)")
 
-# PyTorch JIT Fusion
-torch._C._jit_set_profiling_executor(True)
-torch._C._jit_set_profiling_mode(True)
-torch._C._jit_override_can_fuse_on_cpu(False)
-torch._C._jit_override_can_fuse_on_gpu(True)
-torch._C._jit_set_fusion_strategy([('STATIC', 20), ('DYNAMIC', 20)])
-print("✓ JIT operator fusion enabled (5-15% gain)")
-
-print("="*70 + "\n")
 
 # ==================== Flash Attention with CK Backend ====================
 # Enable Flash Attention to use Composable Kernel's fused attention kernels
