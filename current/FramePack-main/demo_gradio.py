@@ -753,7 +753,7 @@ vae = AutoencoderKLHunyuanVideo.from_pretrained(
     "hunyuanvideo-community/HunyuanVideo",
     subfolder='vae',
     torch_dtype=torch.float16
-).cpu()
+)
 
 feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor')
 
@@ -761,7 +761,7 @@ print("  Loading Transformer (full precision, custom model)...")
 transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained(
     'lllyasviel/FramePackI2V_HY',
     torch_dtype=torch.bfloat16
-).cpu()
+)
 
 print("\nModel loading complete.\n")
 
@@ -1053,18 +1053,7 @@ if USE_TRITONBLAS:
     # Check GPU compatibility
     gpu_compatible = False
     if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0).lower()
-        # tritonBLAS doesn't support gfx1100 (RX 7900 series)
-        # Only supports MI200 (gfx90a) and MI300 (gfx942) series
-        if 'gfx1100' in gpu_name or '7900' in gpu_name or 'radeon rx' in gpu_name:
-            print(f"\n⚠️  tritonBLAS GEMM Optimization: DISABLED")
-            print(f"  Your GPU ({torch.cuda.get_device_name(0)}) uses gfx1100 architecture")
-            print(f"  tritonBLAS doesn't support gfx1100 (only MI200/MI300 series)")
-            print(f"  Falling back to rocBLAS (still good performance!)")
-            USE_TRITONBLAS = False
-        else:
-            gpu_compatible = True
-
+        gpu_compatible = True
     if gpu_compatible:
         print(f"\ntritonBLAS GEMM Optimization: Enabling...")
         print(f"  AMD ROCm optimized matrix multiplication kernels")
