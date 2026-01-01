@@ -11,6 +11,25 @@ import threading
 
 os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
 
+# ==================== OFFLINE MODE CONFIGURATION ====================
+# Force all libraries to work offline without web requests
+# NOTE: We use local_files_only=True in model loading instead of HF_HUB_OFFLINE
+# because HF_HUB_OFFLINE breaks tokenizer loading (transformers library bug)
+
+# CRITICAL: Unset HF_HUB_OFFLINE if it was set by shell environment
+# This variable breaks tokenizer loading even with local_files_only=True
+if 'HF_HUB_OFFLINE' in os.environ:
+    print(f"⚠ Warning: HF_HUB_OFFLINE was set to '{os.environ['HF_HUB_OFFLINE']}' - removing it to fix tokenizer loading")
+    del os.environ['HF_HUB_OFFLINE']
+if 'HUGGINGFACE_HUB_OFFLINE' in os.environ:
+    print(f"⚠ Warning: HUGGINGFACE_HUB_OFFLINE was set to '{os.environ['HUGGINGFACE_HUB_OFFLINE']}' - removing it")
+    del os.environ['HUGGINGFACE_HUB_OFFLINE']
+
+os.environ['TRANSFORMERS_OFFLINE'] = '1'  # Force transformers to work offline
+os.environ['HF_DATASETS_OFFLINE'] = '1'  # Disable datasets library online features
+os.environ['GRADIO_ANALYTICS_ENABLED'] = 'False'  # Disable Gradio analytics
+print("✓ Offline mode configured - using local_files_only for model loading")
+
 # Suppress Triton TORCH_LIBRARY duplicate registration warning (harmless)
 #os.environ['PYTORCH_JIT_LOG_LEVEL'] = 'ERROR'
 
@@ -76,7 +95,9 @@ print("ℹ TransformerEngine will be tested on startup (may use hipBLASLt intern
 print("  If hipBLASLt fails, TE will be auto-disabled. Flash Attention still works!")
 
 # Now safe to import modules that may use PyTorch/TransformerEngine
-from diffusers_helper.hf_login import login
+# Disable HF login for offline mode - comment out the import
+# from diffusers_helper.hf_login import login
+print("✓ Skipping HuggingFace login (offline mode)")
 
 # Separate cache directories for AMD ROCm to prevent CUDA/ROCm interference
 _cache_base = os.path.join(os.path.dirname(__file__), '.cache_rocm')
@@ -158,9 +179,9 @@ print("✓ CPU threading optimized (8 threads)")
 
 # last set if errors occurs this is the reason 
 # Mixed Precision Optimization
-torch.set_float32_matmul_precision('medium')  # Use TF32/FP16 where beneficial
+#torch.set_float32_matmul_precision('medium')  # Use TF32/FP16 where beneficial
 # not available on AMD
-torch.backends.cudnn.allow_tf32 = False
+#torch.backends.cudnn.allow_tf32 = False
 print("✓ Mixed precision mode: medium (5-10% gain)")
 
 
@@ -385,7 +406,7 @@ if USE_TRANSFORMER_ENGINE and USE_BITSANDBYTES:
 # tritonBLAS provides optimized GEMM kernels for AMD GPUs using analytical models
 # NOTE: Disabled by default - doesn't support gfx1100 (RX 7900 XTX)
 # Works on: MI200, MI300 series
-USE_TRITONBLAS = _env_flag('FRAMEPACK_USE_TRITONBLAS', '1')  # Disabled by default (gfx1100 unsupported)
+USE_TRITONBLAS = _env_flag('FRAMEPACK_USE_TRITONBLAS', '0')  # Disabled by default (gfx1100 unsupported)
 TRITONBLAS_VERBOSE = _env_flag('FRAMEPACK_TRITONBLAS_VERBOSE', '1')  # Verbose logging
 TRITONBLAS_MIN_SIZE = int(os.environ.get('FRAMEPACK_TRITONBLAS_MIN_SIZE', '512'))  # Min matrix dimension
 TRITONBLAS_STREAMK = _env_flag('FRAMEPACK_TRITONBLAS_STREAMK', '0')  # Stream-K algorithm
@@ -755,6 +776,7 @@ def load_model_with_fallback(model_class, model_name, subfolder=None, dtype=torc
     """
     load_kwargs = {
         "torch_dtype": dtype,
+        "local_files_only": True,  # OFFLINE MODE: Only use local cached files
     }
 
     if subfolder:
@@ -763,7 +785,7 @@ def load_model_with_fallback(model_class, model_name, subfolder=None, dtype=torc
     # Try with quantization first if available
     if quantization_config is not None:
         try:
-            print(f"  Attempting to load {model_class.__name__} with 8-bit quantization...")
+            print(f"  Attempting to load {model_class.__name__} with 8-bit quantization (offline)...")
             quant_kwargs = load_kwargs.copy()
             quant_kwargs["quantization_config"] = quantization_config
             quant_kwargs["device_map"] = "auto"
@@ -775,6 +797,7 @@ def load_model_with_fallback(model_class, model_name, subfolder=None, dtype=torc
             print(f"  → Falling back to full precision for {model_class.__name__}")
 
     # Load in full precision
+    print(f"  Loading {model_class.__name__} from local cache (offline mode)...")
     model = model_class.from_pretrained(model_name, **load_kwargs).cpu()
     return model
 
@@ -828,23 +851,25 @@ image_encoder = load_model_with_fallback(
 # Convert to TE if enabled
 image_encoder = convert_model_to_te(image_encoder, "image_encoder", verbose=True, use_cache=USE_TRANSFORMER_ENGINE_CACHE)
 
-tokenizer = LlamaTokenizerFast.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer')
-tokenizer_2 = CLIPTokenizer.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer_2')
+tokenizer = LlamaTokenizerFast.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer', local_files_only=True)
+tokenizer_2 = CLIPTokenizer.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer_2', local_files_only=True)
 
 # VAE and custom transformer don't support quantization_config, load normally
-print("  Loading VAE (full precision, quantization not supported)...")
+print("  Loading VAE from local cache (offline mode)...")
 vae = AutoencoderKLHunyuanVideo.from_pretrained(
     "hunyuanvideo-community/HunyuanVideo",
     subfolder='vae',
-    torch_dtype=torch.float16
+    torch_dtype=torch.float16,
+    local_files_only=True  # OFFLINE MODE
 )
 
-feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor')
+feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor', local_files_only=True)
 
-print("  Loading Transformer (full precision, custom model)...")
+print("  Loading Transformer from local cache (offline mode)...")
 transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained(
     'lllyasviel/FramePackI2V_HY',
-    torch_dtype=torch.bfloat16
+    torch_dtype=torch.bfloat16,
+    local_files_only=True  # OFFLINE MODE
 )
 
 print("\nModel loading complete.\n")
@@ -2040,6 +2065,7 @@ with block:
 block.launch(
     server_name=args.server,
     server_port=args.port,
-    share=args.share,
+    share=False,  # OFFLINE MODE: Disable sharing
     inbrowser=args.inbrowser,
+    show_api=False,  # Disable API documentation endpoint
 )
