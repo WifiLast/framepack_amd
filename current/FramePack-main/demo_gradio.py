@@ -53,10 +53,7 @@ print("\n" + "="*70)
 print("Enabling ROCm Platform Optimizations")
 print("="*70)
 
-os.environ['HIP_FORCE_DEV_KERNARG'] = '1'  # Reduce kernel launch latency
-os.environ['HIP_MEM_POOL_SUPPORT'] = '1'   # Improve memory allocation performance
-
-# HSA Runtime Optimizations
+""" # HSA Runtime Optimizations
 os.environ['HSA_ENABLE_SDMA'] = '0'  # Disable SDMA for better kernel scheduling
 os.environ['HSA_ENABLE_INTERRUPT'] = '1'  # Lower latency interrupt mode
 os.environ['GPU_MAX_HW_QUEUES'] = '8'  # Max hardware queues for RDNA3
@@ -66,10 +63,11 @@ os.environ['AMD_SERIALIZE_KERNEL'] = '0'  # Better parallelism
 os.environ['AMD_SERIALIZE_COPY'] = '0'  # Parallel memory copies
 os.environ['AMD_DIRECT_DISPATCH'] = '1'  # Lower dispatch overhead
 os.environ['HIP_HOST_COHERENT'] = '0'  # Faster non-coherent transfers
+os.environ['HIP_VISIBLE_DEVICES'] = '0'  # Single GPU optimization
 
 # Disable profiling overhead
-#os.environ['ROCP_TOOL_LIB'] = ''
-#os.environ['HSA_TOOLS_LIB'] = ''
+os.environ['ROCP_TOOL_LIB'] = ''
+os.environ['HSA_TOOLS_LIB'] = ''
 
 # RDNA3-specific optimizations
 os.environ['AMD_WAVE_SIZE'] = '32'  # Optimal for RDNA3/gfx1100
@@ -78,6 +76,7 @@ os.environ['AMD_OCL_WORKGROUP_SIZE'] = '256'  # Default workgroup size
 
 # Code object compilation optimization
 os.environ['AMD_COMGR_SAVE_TEMPS'] = '1'
+os.environ['AMD_COMGR_REDIRECT_LOGS'] = '0' """
 
 print("✓ ROCm platform flags enabled (5-10% gain)")
 print("="*70 + "\n")
@@ -181,7 +180,6 @@ torch.set_num_threads(8)
 torch.set_num_interop_threads(2)
 print("✓ CPU threading optimized (8 threads)")
 
-# last set if errors occurs this is the reason 
 # Mixed Precision Optimization
 #torch.set_float32_matmul_precision('medium')  # Use TF32/FP16 where beneficial
 # not available on AMD
