@@ -47,6 +47,7 @@ print("✓ Offline mode configured - using local_files_only for model loading")
 print("⚠️  hipBLASLt aggressively disabled (errors expected but harmless)")
 print("   Using rocBLAS fallback - performance still excellent!")
 
+<<<<<<< HEAD
 # ==================== ROCm Platform-Specific Optimizations ====================
 print("\n" + "="*70)
 print("Enabling ROCm Platform Optimizations")
@@ -91,6 +92,8 @@ print("="*70 + "\n")
 #os.environ['PYTORCH_TUNABLEOP_MAX_TUNING_ITERATIONS'] = '100'
 print("✓ TunableOp kernel caching enabled (5-15% gain after warmup)")
 
+=======
+>>>>>>> parent of 0a115a6 (update)
 print("ℹ TransformerEngine will be tested on startup (may use hipBLASLt internally).")
 print("  If hipBLASLt fails, TE will be auto-disabled. Flash Attention still works!")
 
@@ -164,6 +167,7 @@ import numpy as np
 import argparse
 import math
 
+<<<<<<< HEAD
 # ==================== PyTorch-Level Optimizations ====================
 print("\n" + "="*70)
 print("Configuring PyTorch Optimizations")
@@ -185,6 +189,8 @@ print("✓ CPU threading optimized (8 threads)")
 print("✓ Mixed precision mode: medium (5-10% gain)")
 
 
+=======
+>>>>>>> parent of 0a115a6 (update)
 # ==================== Flash Attention with CK Backend ====================
 # Enable Flash Attention to use Composable Kernel's fused attention kernels
 # This provides 30-50% speedup on attention operations
@@ -198,27 +204,6 @@ if torch.cuda.is_available():
         print(f"  Memory-efficient SDP: {torch.backends.cuda.mem_efficient_sdp_enabled()}")
         print(f"  Math SDP (fallback): {torch.backends.cuda.math_sdp_enabled()}")
         print("  Expected speedup: 30-50% on attention operations")
-
-        # ==================== WMMA/Matrix Core Acceleration ====================
-        gpu_name = torch.cuda.get_device_name(0).lower()
-
-        if 'mi300' in gpu_name or 'gfx942' in gpu_name or 'mi200' in gpu_name or 'gfx90a' in gpu_name:
-            # CDNA architectures have full WMMA support
-            os.environ['ROCBLAS_FORCE_WMMA'] = '1'
-            os.environ['ROCBLAS_TENSILE_GEMM_OVERRIDE'] = 'wmma'
-            os.environ['MIOPEN_DEBUG_AMD_WMMA_CONV'] = '1'
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-            print("✓ WMMA/Matrix cores enabled (CDNA architecture)")
-            print("  Expected gain: 10-30% on GEMM operations")
-        elif '7900' in gpu_name or 'gfx1100' in gpu_name:
-            # RDNA3 has AI accelerators but limited WMMA
-            # Let rocBLAS auto-select (don't force)
-            print("✓ RDNA3 AI accelerators available (auto-selected by rocBLAS)")
-            print("  Expected gain: 5-15% on compatible operations")
-        else:
-            print("⚠ Unknown GPU architecture - WMMA not configured")
-
     except Exception as e:
         print(f"⚠ Flash Attention configuration failed: {e}")
         print("  Continuing with standard attention...")
@@ -911,47 +896,6 @@ text_encoder.eval()
 text_encoder_2.eval()
 image_encoder.eval()
 transformer.eval()
-
-# ==================== Gradient Checkpointing for Memory Efficiency ====================
-ENABLE_GRADIENT_CHECKPOINTING = _env_flag('FRAMEPACK_GRADIENT_CHECKPOINTING', '0')
-
-if ENABLE_GRADIENT_CHECKPOINTING:
-    print("\n" + "="*70)
-    print("Enabling Gradient Checkpointing")
-    print("="*70)
-    print("Note: Reduces memory usage by ~30-50% at cost of ~10-20% slower inference")
-
-    checkpointed_models = []
-
-    # Enable gradient checkpointing on models that support it
-    for model_name, model in [
-        ('VAE', vae),
-        ('Text Encoder', text_encoder),
-        ('Text Encoder 2', text_encoder_2),
-        ('Image Encoder', image_encoder),
-        ('Transformer', transformer)
-    ]:
-        if hasattr(model, 'gradient_checkpointing_enable'):
-            try:
-                model.gradient_checkpointing_enable()
-                checkpointed_models.append(model_name)
-                print(f"  ✓ {model_name}: Gradient checkpointing enabled")
-            except Exception as e:
-                print(f"  ⚠ {model_name}: Failed to enable - {e}")
-        else:
-            print(f"  ○ {model_name}: Not supported")
-
-    if checkpointed_models:
-        print(f"\n✓ Gradient checkpointing enabled on {len(checkpointed_models)} models")
-        print(f"  Models: {', '.join(checkpointed_models)}")
-        print(f"  Memory savings: ~30-50%")
-        print(f"  Speed cost: ~10-20% slower")
-    else:
-        print("\n⚠ No models support gradient checkpointing")
-
-    print("="*70 + "\n")
-else:
-    print("\nGradient checkpointing: Disabled (set FRAMEPACK_GRADIENT_CHECKPOINTING=1 to enable)")
 
 if not high_vram:
     vae.enable_slicing()
