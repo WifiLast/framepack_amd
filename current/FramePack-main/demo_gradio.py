@@ -1,3 +1,5 @@
+from diffusers_helper.hf_login import login
+
 import os
 import runpy
 import ctypes
@@ -6,100 +8,7 @@ import time
 from collections import OrderedDict
 import threading
 
-# ==================== CRITICAL: Set Environment Variables FIRST ====================
-# These MUST be set before ANY PyTorch/TransformerEngine imports
-
 os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
-
-# ==================== OFFLINE MODE CONFIGURATION ====================
-# Force all libraries to work offline without web requests
-# NOTE: We use local_files_only=True in model loading instead of HF_HUB_OFFLINE
-# because HF_HUB_OFFLINE breaks tokenizer loading (transformers library bug)
-
-# CRITICAL: Unset HF_HUB_OFFLINE if it was set by shell environment
-# This variable breaks tokenizer loading even with local_files_only=True
-if 'HF_HUB_OFFLINE' in os.environ:
-    print(f"⚠ Warning: HF_HUB_OFFLINE was set to '{os.environ['HF_HUB_OFFLINE']}' - removing it to fix tokenizer loading")
-    del os.environ['HF_HUB_OFFLINE']
-if 'HUGGINGFACE_HUB_OFFLINE' in os.environ:
-    print(f"⚠ Warning: HUGGINGFACE_HUB_OFFLINE was set to '{os.environ['HUGGINGFACE_HUB_OFFLINE']}' - removing it")
-    del os.environ['HUGGINGFACE_HUB_OFFLINE']
-
-os.environ['TRANSFORMERS_OFFLINE'] = '1'  # Force transformers to work offline
-os.environ['HF_DATASETS_OFFLINE'] = '1'  # Disable datasets library online features
-os.environ['GRADIO_ANALYTICS_ENABLED'] = 'False'  # Disable Gradio analytics
-print("✓ Offline mode configured - using local_files_only for model loading")
-
-# Suppress Triton TORCH_LIBRARY duplicate registration warning (harmless)
-#os.environ['PYTORCH_JIT_LOG_LEVEL'] = 'ERROR'
-
-# Disable torch.compile to avoid Triton namespace conflicts
-#os.environ['NVTE_TORCH_COMPILE'] = '0'
-
-# ==================== Composable Kernel Optimizations ====================
-# Note: hipBLASLt cannot be disabled via environment variables - TransformerEngine
-# has it compiled in. We will test TE on startup and disable if hipBLASLt fails.
-# Flash Attention (below) still provides 30-50% speedup via CK backend
-
-# Fix for missing Tensile library path (rocBLAS backend)
-#os.environ['ROCBLAS_TENSILE_LIBPATH'] = '/opt/rocm/lib/rocblas/library'
-
-print("⚠️  hipBLASLt aggressively disabled (errors expected but harmless)")
-print("   Using rocBLAS fallback - performance still excellent!")
-
-<<<<<<< HEAD
-# ==================== ROCm Platform-Specific Optimizations ====================
-print("\n" + "="*70)
-print("Enabling ROCm Platform Optimizations")
-print("="*70)
-
-""" # HSA Runtime Optimizations
-os.environ['HSA_ENABLE_SDMA'] = '0'  # Disable SDMA for better kernel scheduling
-os.environ['HSA_ENABLE_INTERRUPT'] = '1'  # Lower latency interrupt mode
-os.environ['GPU_MAX_HW_QUEUES'] = '8'  # Max hardware queues for RDNA3
-
-# HIP Runtime Optimizations
-os.environ['AMD_SERIALIZE_KERNEL'] = '0'  # Better parallelism
-os.environ['AMD_SERIALIZE_COPY'] = '0'  # Parallel memory copies
-os.environ['AMD_DIRECT_DISPATCH'] = '1'  # Lower dispatch overhead
-os.environ['HIP_HOST_COHERENT'] = '0'  # Faster non-coherent transfers
-os.environ['HIP_VISIBLE_DEVICES'] = '0'  # Single GPU optimization
-
-# Disable profiling overhead
-os.environ['ROCP_TOOL_LIB'] = ''
-os.environ['HSA_TOOLS_LIB'] = ''
-
-# RDNA3-specific optimizations
-os.environ['AMD_WAVE_SIZE'] = '32'  # Optimal for RDNA3/gfx1100
-os.environ['AMD_MAX_WAVES_PER_SIMD'] = '16'  # Max occupancy
-os.environ['AMD_OCL_WORKGROUP_SIZE'] = '256'  # Default workgroup size
-
-# Code object compilation optimization
-os.environ['AMD_COMGR_SAVE_TEMPS'] = '1'
-os.environ['AMD_COMGR_REDIRECT_LOGS'] = '0' """
-
-print("✓ ROCm platform flags enabled (5-10% gain)")
-print("="*70 + "\n")
-
-# ==================== TunableOp Kernel Caching ====================
-#os.environ['PYTORCH_TUNABLEOP_ENABLED'] = '1'
-#os.environ['PYTORCH_TUNABLEOP_TUNING'] = '1'
-#os.environ['PYTORCH_TUNABLEOP_FILENAME'] = os.path.join(
-#    os.path.dirname(__file__), 'tunableop_results.csv'
-#)
-#os.environ['PYTORCH_TUNABLEOP_MAX_TUNING_DURATION_MS'] = '30'
-#os.environ['PYTORCH_TUNABLEOP_MAX_TUNING_ITERATIONS'] = '100'
-print("✓ TunableOp kernel caching enabled (5-15% gain after warmup)")
-
-=======
->>>>>>> parent of 0a115a6 (update)
-print("ℹ TransformerEngine will be tested on startup (may use hipBLASLt internally).")
-print("  If hipBLASLt fails, TE will be auto-disabled. Flash Attention still works!")
-
-# Now safe to import modules that may use PyTorch/TransformerEngine
-# Disable HF login for offline mode - comment out the import
-# from diffusers_helper.hf_login import login
-print("✓ Skipping HuggingFace login (offline mode)")
 
 # Separate cache directories for AMD ROCm to prevent CUDA/ROCm interference
 _cache_base = os.path.join(os.path.dirname(__file__), '.cache_rocm')
@@ -166,46 +75,6 @@ import numpy as np
 import argparse
 import math
 
-<<<<<<< HEAD
-# ==================== PyTorch-Level Optimizations ====================
-print("\n" + "="*70)
-print("Configuring PyTorch Optimizations")
-print("="*70)
-
-# CPU Threading Optimization
-os.environ['OMP_NUM_THREADS'] = '8'  # Adjust to your CPU cores
-os.environ['MKL_NUM_THREADS'] = '8'
-os.environ['OPENBLAS_NUM_THREADS'] = '8'
-torch.set_num_threads(8)
-torch.set_num_interop_threads(2)
-print("✓ CPU threading optimized (8 threads)")
-
-# Mixed Precision Optimization
-#torch.set_float32_matmul_precision('medium')  # Use TF32/FP16 where beneficial
-# not available on AMD
-#torch.backends.cudnn.allow_tf32 = False
-print("✓ Mixed precision mode: medium (5-10% gain)")
-
-
-=======
->>>>>>> parent of 0a115a6 (update)
-# ==================== Flash Attention with CK Backend ====================
-# Enable Flash Attention to use Composable Kernel's fused attention kernels
-# This provides 30-50% speedup on attention operations
-if torch.cuda.is_available():
-    try:
-        torch.backends.cuda.enable_flash_sdp(True)  # Flash attention (uses CK on ROCm)
-        torch.backends.cuda.enable_mem_efficient_sdp(True)  # Memory-efficient variant
-        torch.backends.cuda.enable_math_sdp(True)  # Keep math fallback enabled for compatibility
-        print("✓ Flash Attention enabled with Composable Kernel backend")
-        print(f"  Flash SDP: {torch.backends.cuda.flash_sdp_enabled()}")
-        print(f"  Memory-efficient SDP: {torch.backends.cuda.mem_efficient_sdp_enabled()}")
-        print(f"  Math SDP (fallback): {torch.backends.cuda.math_sdp_enabled()}")
-        print("  Expected speedup: 30-50% on attention operations")
-    except Exception as e:
-        print(f"⚠ Flash Attention configuration failed: {e}")
-        print("  Continuing with standard attention...")
-
 # Initialize MIOpen fallback system for AMD GPUs (before any torch operations)
 from diffusers_helper.miopen_fallback import initialize_miopen_fallback, MIOpenFallbackHandler
 initialize_miopen_fallback(use_monkey_patch=True, verbose=True)
@@ -243,50 +112,12 @@ except ImportError:
 
 # Try to import Transformer Engine for FP8 optimization on AMD ROCm
 # This provides an alternative to bitsandbytes with native FP8 support on MI300 GPUs
-# IMPORTANT: TransformerEngine may have hipBLASLt compiled in, which causes issues on some systems
 HAS_TRANSFORMER_ENGINE = False
 try:
-    # Test import in a way that will catch hipBLASLt errors early
     import transformer_engine.pytorch as te
     from transformer_engine.common.recipe import Format, DelayedScaling
-
-    # Test if TE works without hipBLASLt errors by creating a tiny layer
-    try:
-        if torch.cuda.is_available():
-            test_device = torch.device('cuda:0')
-            # CRITICAL: params_dtype must match input dtype
-            test_layer = te.Linear(8, 8, params_dtype=torch.float16, device=test_device, bias=False)
-            test_input = torch.randn(1, 8, device=test_device, dtype=torch.float16)
-            _ = test_layer(test_input)
-            torch.cuda.synchronize()
-            del test_layer, test_input
-            HAS_TRANSFORMER_ENGINE = True
-            print("✓ Transformer Engine available - FP8 optimization enabled for AMD MI300 GPUs")
-        else:
-            print("⚠ No GPU available - skipping Transformer Engine")
-    except RuntimeError as e:
-        if "HIPBLASLT" in str(e).upper() or "Could not load" in str(e):
-            print("⚠ Transformer Engine has hipBLASLt compatibility issues - DISABLED")
-            print("  Error:", str(e)[:100])
-            print("  Falling back to standard PyTorch operations")
-            print("  Note: You still have Flash Attention (30-50% speedup) + rocBLAS")
-            HAS_TRANSFORMER_ENGINE = False
-            # Clean up the import
-            import sys
-            if 'transformer_engine' in sys.modules:
-                del sys.modules['transformer_engine']
-                del sys.modules['transformer_engine.pytorch']
-        else:
-            raise
-    except AssertionError as e:
-        # Catch dtype mismatch errors
-        if "Data types for parameters must match" in str(e):
-            print("⚠ Transformer Engine dtype mismatch - DISABLED")
-            print("  Error:", str(e)[:100])
-            print("  Falling back to standard PyTorch operations")
-            HAS_TRANSFORMER_ENGINE = False
-        else:
-            raise
+    HAS_TRANSFORMER_ENGINE = True
+    print("Transformer Engine available - FP8 optimization enabled for AMD MI300 GPUs")
 except ImportError:
     print("Note: Transformer Engine not installed. Using bitsandbytes or full precision.")
     print("Install with: pip install transformer_engine for AMD ROCm FP8 optimizations.")
@@ -320,8 +151,6 @@ from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, so
 from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
 from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
 from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete
-# Import tritonBLAS patch for AMD GPU optimization
-from diffusers_helper.tritonblas_patch import patch_pytorch_with_tritonblas, print_tritonblas_stats
 # Try to import log_memory_status (only available in AMD version)
 try:
     from diffusers_helper.memory import log_memory_status
@@ -329,15 +158,6 @@ except ImportError:
     # Fallback for original CUDA version without log_memory_status
     def log_memory_status(device=None, prefix=""):
         pass  # No-op for compatibility
-
-# Import Composable Kernel attention utilities for direct patching
-try:
-    from diffusers_helper.ck_attention import patch_model_attention_with_ck, enable_ck_flash_attention
-    HAS_CK_ATTENTION = True
-    print("✓ Composable Kernel attention module loaded")
-except ImportError:
-    HAS_CK_ATTENTION = False
-    print("⚠ CK attention module not found. Flash Attention will still use CK backend automatically.")
 
 # Try to import psutil for RAM monitoring
 try:
@@ -372,7 +192,7 @@ def _env_flag(name: str, default: str = '0') -> bool:
     return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
 
 # Bitsandbytes 8-bit optimization configuration (AMD ROCm compatible)
-USE_BITSANDBYTES = _env_flag('FRAMEPACK_USE_BITSANDBYTES', '1')  # Enabled by default
+USE_BITSANDBYTES = _env_flag('FRAMEPACK_USE_BITSANDBYTES', '0')  # Enabled by default
 
 # Transformer Engine optimization configuration (AMD ROCm compatible)
 # Note: TE and Bitsandbytes are mutually exclusive - TE takes priority if both are enabled
@@ -384,16 +204,6 @@ if USE_TRANSFORMER_ENGINE and USE_BITSANDBYTES:
     print("Note: Both Transformer Engine and Bitsandbytes are enabled.")
     print("  Transformer Engine will be used (takes priority)")
     USE_BITSANDBYTES = False
-
-# tritonBLAS optimization configuration (AMD ROCm compatible)
-# tritonBLAS provides optimized GEMM kernels for AMD GPUs using analytical models
-# NOTE: Disabled by default - doesn't support gfx1100 (RX 7900 XTX)
-# Works on: MI200, MI300 series
-USE_TRITONBLAS = _env_flag('FRAMEPACK_USE_TRITONBLAS', '0')  # Disabled by default (gfx1100 unsupported)
-TRITONBLAS_VERBOSE = _env_flag('FRAMEPACK_TRITONBLAS_VERBOSE', '1')  # Verbose logging
-TRITONBLAS_MIN_SIZE = int(os.environ.get('FRAMEPACK_TRITONBLAS_MIN_SIZE', '512'))  # Min matrix dimension
-TRITONBLAS_STREAMK = _env_flag('FRAMEPACK_TRITONBLAS_STREAMK', '0')  # Stream-K algorithm
-TRITONBLAS_FALLBACK = _env_flag('FRAMEPACK_TRITONBLAS_FALLBACK', '1')  # Fallback to PyTorch on error
 
 
 def get_quantization_config():
@@ -603,12 +413,16 @@ def convert_model_to_te(model: torch.nn.Module, model_name: str, verbose: bool =
                         device = child.weight.device
                         dtype = child.weight.dtype
 
+                        # CRITICAL FIX: Force float16 for TE on AMD ROCm
+                        # bfloat16 + TE + AMD ROCm produces NaN, but float16 works
+                        te_dtype = torch.float16 if dtype == torch.bfloat16 else dtype
+
                         # Create TE Linear layer
                         te_linear = te.Linear(
                             in_features=in_features,
                             out_features=out_features,
                             bias=bias,
-                            params_dtype=dtype,
+                            params_dtype=te_dtype,
                             device=device,
                         )
 
@@ -759,7 +573,6 @@ def load_model_with_fallback(model_class, model_name, subfolder=None, dtype=torc
     """
     load_kwargs = {
         "torch_dtype": dtype,
-        "local_files_only": True,  # OFFLINE MODE: Only use local cached files
     }
 
     if subfolder:
@@ -768,7 +581,7 @@ def load_model_with_fallback(model_class, model_name, subfolder=None, dtype=torc
     # Try with quantization first if available
     if quantization_config is not None:
         try:
-            print(f"  Attempting to load {model_class.__name__} with 8-bit quantization (offline)...")
+            print(f"  Attempting to load {model_class.__name__} with 8-bit quantization...")
             quant_kwargs = load_kwargs.copy()
             quant_kwargs["quantization_config"] = quantization_config
             quant_kwargs["device_map"] = "auto"
@@ -780,7 +593,6 @@ def load_model_with_fallback(model_class, model_name, subfolder=None, dtype=torc
             print(f"  → Falling back to full precision for {model_class.__name__}")
 
     # Load in full precision
-    print(f"  Loading {model_class.__name__} from local cache (offline mode)...")
     model = model_class.from_pretrained(model_name, **load_kwargs).cpu()
     return model
 
@@ -788,6 +600,112 @@ def load_model_with_fallback(model_class, model_name, subfolder=None, dtype=torc
 # Create quantization config for AMD ROCm bitsandbytes or TE FP8
 quantization_config = get_quantization_config()
 te_fp8_recipe = get_te_fp8_recipe() if USE_TRANSFORMER_ENGINE else None
+
+# ===== NaN Debugging System =====
+# Enable this to track where NaN values first appear during generation
+ENABLE_NAN_DEBUGGING = _env_flag('FRAMEPACK_DEBUG_NAN', '1')  # Enabled by default to diagnose black output
+
+# Global state for NaN debugging
+nan_debug_hooks = []
+nan_first_detected = {'layer': None, 'step': None, 'stats': None}
+
+def register_nan_debug_hooks(model, prefix="model"):
+    """
+    Register forward hooks on all layers to detect NaN values.
+
+    This helps identify exactly where NaN values first appear in the forward pass.
+    """
+    global nan_debug_hooks, nan_first_detected
+
+    if not ENABLE_NAN_DEBUGGING:
+        return
+
+    def make_hook(layer_name):
+        def hook_fn(module, input, output):
+            # Skip if we've already found the first NaN
+            if nan_first_detected['layer'] is not None:
+                return
+
+            # Check output for NaN
+            if isinstance(output, torch.Tensor):
+                tensors_to_check = [output]
+            elif isinstance(output, (tuple, list)):
+                tensors_to_check = [t for t in output if isinstance(t, torch.Tensor)]
+            else:
+                return
+
+            for tensor in tensors_to_check:
+                if torch.isnan(tensor).any():
+                    nan_count = torch.isnan(tensor).sum().item()
+                    inf_count = torch.isinf(tensor).sum().item()
+
+                    stats = {
+                        'layer': layer_name,
+                        'shape': tuple(tensor.shape),
+                        'dtype': str(tensor.dtype),
+                        'device': str(tensor.device),
+                        'nan_count': nan_count,
+                        'inf_count': inf_count,
+                        'min': tensor[~torch.isnan(tensor)].min().item() if (~torch.isnan(tensor)).any() else float('nan'),
+                        'max': tensor[~torch.isnan(tensor)].max().item() if (~torch.isnan(tensor)).any() else float('nan'),
+                        'mean': tensor[~torch.isnan(tensor)].mean().item() if (~torch.isnan(tensor)).any() else float('nan'),
+                    }
+
+                    nan_first_detected['layer'] = layer_name
+                    nan_first_detected['stats'] = stats
+
+                    print(f"\n{'='*80}")
+                    print(f"NaN DETECTED IN LAYER: {layer_name}")
+                    print(f"{'='*80}")
+                    print(f"  Shape: {stats['shape']}")
+                    print(f"  Dtype: {stats['dtype']}")
+                    print(f"  Device: {stats['device']}")
+                    print(f"  NaN count: {nan_count:,} ({100*nan_count/tensor.numel():.2f}%)")
+                    print(f"  Inf count: {inf_count:,}")
+                    print(f"  Valid values - min: {stats['min']:.6f}, max: {stats['max']:.6f}, mean: {stats['mean']:.6f}")
+                    print(f"{'='*80}\n")
+
+                    # Also check input tensors to see if NaN came from input
+                    if isinstance(input, torch.Tensor):
+                        input_tensors = [input]
+                    elif isinstance(input, (tuple, list)):
+                        input_tensors = [t for t in input if isinstance(t, torch.Tensor)]
+                    else:
+                        input_tensors = []
+
+                    for idx, in_tensor in enumerate(input_tensors):
+                        if torch.isnan(in_tensor).any():
+                            print(f"  WARNING: Input tensor {idx} also contains NaN!")
+                        else:
+                            print(f"  Input tensor {idx}: clean (no NaN)")
+
+                    break  # Only report first NaN occurrence
+
+        return hook_fn
+
+    # Register hooks on all modules
+    for name, module in model.named_modules():
+        if name:  # Skip root module
+            full_name = f"{prefix}.{name}"
+            hook = module.register_forward_hook(make_hook(full_name))
+            nan_debug_hooks.append(hook)
+
+    print(f"Registered {len(nan_debug_hooks)} NaN debugging hooks on {prefix}")
+
+def clear_nan_debug_hooks():
+    """Remove all NaN debugging hooks"""
+    global nan_debug_hooks, nan_first_detected
+    for hook in nan_debug_hooks:
+        hook.remove()
+    nan_debug_hooks = []
+    nan_first_detected = {'layer': None, 'step': None, 'stats': None}
+
+def reset_nan_detection():
+    """Reset NaN detection state (call before each generation)"""
+    global nan_first_detected
+    nan_first_detected = {'layer': None, 'step': None, 'stats': None}
+
+# ===== End NaN Debugging System =====
 
 if USE_TRANSFORMER_ENGINE and HAS_TRANSFORMER_ENGINE:
     if USE_TRANSFORMER_ENGINE_FP8:
@@ -802,6 +720,10 @@ elif quantization_config is not None:
 else:
     print("\nLoading models in full precision...\n")
 
+if ENABLE_NAN_DEBUGGING:
+    print("⚠ NaN debugging enabled - will track where NaN values first appear")
+    print("  Set FRAMEPACK_DEBUG_NAN=0 to disable\n")
+
 # Load models with automatic fallback to full precision if quantization fails
 # For TE, we load in FP16 first, then convert Linear layers to TE
 text_encoder = load_model_with_fallback(
@@ -811,8 +733,9 @@ text_encoder = load_model_with_fallback(
     dtype=torch.float16,
     quantization_config=quantization_config if not USE_TRANSFORMER_ENGINE else None
 )
-# Convert to TE if enabled
-text_encoder = convert_model_to_te(text_encoder, "text_encoder", verbose=True, use_cache=USE_TRANSFORMER_ENGINE_CACHE)
+# SKIP TE conversion for text encoder - it produces NaN outputs on AMD ROCm
+# Only convert transformer (the main model) to TE for better performance
+print("  Skipping TE conversion for text_encoder (causes NaN on AMD ROCm)")
 
 text_encoder_2 = load_model_with_fallback(
     CLIPTextModel,
@@ -821,8 +744,8 @@ text_encoder_2 = load_model_with_fallback(
     dtype=torch.float16,
     quantization_config=quantization_config if not USE_TRANSFORMER_ENGINE else None
 )
-# Convert to TE if enabled
-text_encoder_2 = convert_model_to_te(text_encoder_2, "text_encoder_2", verbose=True, use_cache=USE_TRANSFORMER_ENGINE_CACHE)
+# SKIP TE conversion for text encoder 2 - it produces NaN outputs on AMD ROCm
+print("  Skipping TE conversion for text_encoder_2 (causes NaN on AMD ROCm)")
 
 image_encoder = load_model_with_fallback(
     SiglipVisionModel,
@@ -831,63 +754,34 @@ image_encoder = load_model_with_fallback(
     dtype=torch.float16,
     quantization_config=quantization_config if not USE_TRANSFORMER_ENGINE else None
 )
-# Convert to TE if enabled
-image_encoder = convert_model_to_te(image_encoder, "image_encoder", verbose=True, use_cache=USE_TRANSFORMER_ENGINE_CACHE)
+# SKIP TE conversion for image encoder - it produces NaN outputs on AMD ROCm
+print("  Skipping TE conversion for image_encoder (causes NaN on AMD ROCm)")
 
-tokenizer = LlamaTokenizerFast.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer', local_files_only=True)
-tokenizer_2 = CLIPTokenizer.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer_2', local_files_only=True)
+tokenizer = LlamaTokenizerFast.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer')
+tokenizer_2 = CLIPTokenizer.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer_2')
 
 # VAE and custom transformer don't support quantization_config, load normally
-print("  Loading VAE from local cache (offline mode)...")
+print("  Loading VAE (full precision, quantization not supported)...")
 vae = AutoencoderKLHunyuanVideo.from_pretrained(
     "hunyuanvideo-community/HunyuanVideo",
     subfolder='vae',
-    torch_dtype=torch.float16,
-    local_files_only=True  # OFFLINE MODE
-)
+    torch_dtype=torch.float16
+).cpu()
 
-feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor', local_files_only=True)
+feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor')
 
-print("  Loading Transformer from local cache (offline mode)...")
+print("  Loading Transformer (full precision, custom model)...")
 transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained(
     'lllyasviel/FramePackI2V_HY',
-    torch_dtype=torch.bfloat16,
-    local_files_only=True  # OFFLINE MODE
-)
+    torch_dtype=torch.bfloat16
+).cpu()
+
+# Convert transformer to Transformer Engine if enabled
+if USE_TRANSFORMER_ENGINE and HAS_TRANSFORMER_ENGINE:
+    print("  Converting transformer to Transformer Engine...")
+    transformer = convert_model_to_te(transformer, "transformer", verbose=True, use_cache=USE_TRANSFORMER_ENGINE_CACHE)
 
 print("\nModel loading complete.\n")
-
-# ==================== Optional: Direct CK Attention Patching ====================
-# Patch attention layers with CK optimized versions (optional, for maximum performance)
-USE_CK_ATTENTION_PATCH = _env_flag('FRAMEPACK_USE_CK_ATTENTION', '1')
-
-if USE_CK_ATTENTION_PATCH and HAS_CK_ATTENTION:
-    print("\n" + "="*70)
-    print("Patching models with Composable Kernel attention...")
-    print("="*70)
-
-    num_patched = 0
-    try:
-        print("\nPatching text_encoder...")
-        num_patched += patch_model_attention_with_ck(text_encoder, verbose=True)
-
-        print("\nPatching text_encoder_2...")
-        num_patched += patch_model_attention_with_ck(text_encoder_2, verbose=True)
-
-        print("\nPatching image_encoder...")
-        num_patched += patch_model_attention_with_ck(image_encoder, verbose=True)
-
-        print("\n" + "="*70)
-        print(f"✓ Successfully patched {num_patched} attention modules with CK FMHA")
-        print("  Expected additional speedup: 5-15% on attention operations")
-        print("="*70 + "\n")
-    except Exception as e:
-        print(f"\n⚠ CK attention patching failed: {e}")
-        print("  Continuing with Flash Attention backend (still using CK)...\n")
-elif USE_CK_ATTENTION_PATCH and not HAS_CK_ATTENTION:
-    print("\n⚠ CK attention patching requested but module not available")
-    print("  Ensure diffusers_helper/ck_attention.py exists")
-    print("  Continuing with Flash Attention backend (still uses CK)...\n")
 
 vae.eval()
 text_encoder.eval()
@@ -913,6 +807,14 @@ text_encoder_2.requires_grad_(False)
 image_encoder.requires_grad_(False)
 transformer.requires_grad_(False)
 
+# Register NaN debugging hooks if enabled
+if ENABLE_NAN_DEBUGGING:
+    print("\n" + "="*60)
+    print("Registering NaN debugging hooks on transformer model")
+    print("="*60)
+    register_nan_debug_hooks(transformer, prefix="transformer")
+    print("="*60 + "\n")
+
 # Pin models to RAM for faster CPU-GPU transfers (if enabled)
 if ENABLE_PINNED_MEMORY:
     print('\nPinning models to RAM for optimized memory transfers...')
@@ -924,48 +826,6 @@ if ENABLE_PINNED_MEMORY:
     print('Model pinning complete.\n')
 else:
     print('\nSkipping model pinning (disabled or insufficient RAM).\n')
-
-# ==================== Memory Transfer Optimizations ====================
-# Configure optimized CPU-GPU transfers for AMD ROCm
-from diffusers_helper.memory import MemoryOptimizationConfig
-
-# Determine if we should use advanced optimizations
-USE_MEMORY_OPTIMIZATIONS = _env_flag('FRAMEPACK_USE_MEMORY_OPTIMIZATIONS', '1')  # Enabled by default
-USE_PINNED_MEMORY_TRANSFERS = _env_flag('FRAMEPACK_PINNED_TRANSFERS', '1')  # Enabled by default
-USE_ASYNC_STREAMS = _env_flag('FRAMEPACK_ASYNC_STREAMS', '1')  # Enabled by default
-CACHE_MEMORY_STATS = _env_flag('FRAMEPACK_CACHE_MEM_STATS', '1')  # Enabled by default
-
-if USE_MEMORY_OPTIMIZATIONS:
-    # Only use pinned transfers if we have enough RAM headroom
-    use_pinned = USE_PINNED_MEMORY_TRANSFERS and ram_headroom_gb > 2.0
-    # Async requires pinned memory
-    use_async = USE_ASYNC_STREAMS and use_pinned
-
-    memory_optim_config = MemoryOptimizationConfig(
-        use_pinned_memory=use_pinned,
-        use_async_streams=use_async,
-        cache_memory_stats=CACHE_MEMORY_STATS,
-        stats_cache_ttl=0.1,  # Cache memory stats for 100ms
-    )
-
-    print(f'\nMemory Transfer Optimizations: Enabled')
-    print(f'  Pinned memory transfers: {memory_optim_config.use_pinned_memory}')
-    if USE_PINNED_MEMORY_TRANSFERS and ram_headroom_gb <= 2.0:
-        print(f'    ⚠ Disabled: Insufficient RAM headroom ({ram_headroom_gb:.1f} GB < 2.0 GB)')
-    print(f'  Async CUDA streams: {memory_optim_config.use_async_streams}')
-    if USE_ASYNC_STREAMS and not use_async:
-        if not use_pinned:
-            print(f'    ⚠ Disabled: Requires pinned memory')
-    print(f'  Memory stats caching: {memory_optim_config.cache_memory_stats}')
-
-    if memory_optim_config.use_pinned_memory:
-        print(f'  Expected speedup: 30-50% faster model loading')
-    else:
-        print(f'  Caching only - modest speedup (~10-15%)')
-else:
-    memory_optim_config = None
-    print(f'\nMemory Transfer Optimizations: Disabled')
-    print(f'  Enable with: FRAMEPACK_USE_MEMORY_OPTIMIZATIONS=1')
 
 IS_HIP_RUNTIME = getattr(torch.version, "hip", None) is not None
 
@@ -1139,43 +999,6 @@ elif USE_BITSANDBYTES and not HAS_BITSANDBYTES:
     print(f"\nBitsandbytes 8-bit Optimization: Requested but not available")
     print(f"  Install AMD ROCm version with: pip install bitsandbytes")
     USE_BITSANDBYTES = False
-
-# tritonBLAS configuration and activation
-if USE_TRITONBLAS:
-    # Check GPU compatibility
-    gpu_compatible = False
-    if torch.cuda.is_available():
-        gpu_compatible = True
-    if gpu_compatible:
-        print(f"\ntritonBLAS GEMM Optimization: Enabling...")
-        print(f"  AMD ROCm optimized matrix multiplication kernels")
-        print(f"  Uses analytical model for optimal kernel selection (no autotuning)")
-        print(f"  Compatible with MI200, MI300 GPUs")
-
-        # Apply the monkey-patch
-        patch_pytorch_with_tritonblas(
-            enable=True,
-            verbose=TRITONBLAS_VERBOSE,
-            fallback_to_torch=TRITONBLAS_FALLBACK,
-            min_size=TRITONBLAS_MIN_SIZE,
-            use_streamk=TRITONBLAS_STREAMK,
-        )
-
-    print(f"  Configuration:")
-    print(f"    - Minimum matrix dimension: {TRITONBLAS_MIN_SIZE}")
-    print(f"    - Stream-K algorithm: {'Enabled' if TRITONBLAS_STREAMK else 'Disabled'}")
-    print(f"    - PyTorch fallback: {'Enabled' if TRITONBLAS_FALLBACK else 'Disabled'}")
-    print(f"    - Verbose logging: {'Enabled' if TRITONBLAS_VERBOSE else 'Disabled'}")
-    print(f"  Environment variables:")
-    print(f"    FRAMEPACK_USE_TRITONBLAS=1")
-    print(f"    FRAMEPACK_TRITONBLAS_MIN_SIZE={TRITONBLAS_MIN_SIZE}")
-    if TRITONBLAS_STREAMK:
-        print(f"    FRAMEPACK_TRITONBLAS_STREAMK=1")
-    if TRITONBLAS_VERBOSE:
-        print(f"    FRAMEPACK_TRITONBLAS_VERBOSE=1")
-else:
-    print(f"\ntritonBLAS GEMM Optimization: Disabled")
-    print(f"  Enable with: FRAMEPACK_USE_TRITONBLAS=1")
 
 KEEP_VAE_FP32_NORMALIZATION = _env_flag('FRAMEPACK_VAE_FP32_NORM', '1')
 MAX_LATENT_CACHE_ITEMS = int(os.environ.get('FRAMEPACK_LATENT_CACHE_SIZE', '4'))
@@ -1580,6 +1403,11 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
     stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
 
+    # Reset NaN detection state for this generation
+    if ENABLE_NAN_DEBUGGING:
+        reset_nan_detection()
+        print("NaN detection reset - monitoring enabled for this generation\n")
+
     flush_rocm_allocator('worker-start')
 
     latent_segments: list[dict] = []
@@ -1607,7 +1435,6 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         if not high_vram:
             fake_diffusers_current_device(text_encoder, gpu)  # since we only encode one text - that is one model move and one encode, offload is same time consumption since it is also one load and one encode.
             load_model_as_complete(text_encoder_2, target_device=gpu)
-            # Note: load_model_as_complete doesn't support optim_config yet, but internally calls .to(device) which is fast enough for text encoders
 
         # Use Transformer Engine FP8 autocast if enabled (MI300+ only)
         # For RX 7900, TE layers run without FP8 autocast
@@ -1630,6 +1457,20 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
         llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
         llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
+
+        # DEBUG: Check text embeddings for NaN
+        if ENABLE_NAN_DEBUGGING:
+            if torch.isnan(llama_vec).any():
+                nan_count = torch.isnan(llama_vec).sum().item()
+                print(f"\n⚠ WARNING: llama_vec contains {nan_count} NaN values after encoding!")
+                print(f"  Shape: {llama_vec.shape}, Dtype: {llama_vec.dtype}")
+                print(f"  This means the text encoder (LlamaModel) is producing NaN!")
+            if torch.isnan(clip_l_pooler).any():
+                nan_count = torch.isnan(clip_l_pooler).sum().item()
+                print(f"\n⚠ WARNING: clip_l_pooler contains {nan_count} NaN values after encoding!")
+                print(f"  Shape: {clip_l_pooler.shape}, Dtype: {clip_l_pooler.dtype}")
+            if not torch.isnan(llama_vec).any() and not torch.isnan(clip_l_pooler).any():
+                print("✓ Text embeddings are clean (no NaN)")
 
         # Unload text encoders immediately after use (not needed anymore)
         if not high_vram:
@@ -1673,7 +1514,6 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
         if not high_vram:
             load_model_as_complete(image_encoder, target_device=gpu)
-            # Note: load_model_as_complete doesn't support optim_config yet
 
         # Use Transformer Engine FP8 autocast if enabled (MI300+ only)
         # For RX 7900, TE layers run without FP8 autocast
@@ -1698,6 +1538,30 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         clip_l_pooler = clip_l_pooler.to(transformer.dtype)
         clip_l_pooler_n = clip_l_pooler_n.to(transformer.dtype)
         image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(transformer.dtype)
+
+        # DEBUG: Check embeddings after dtype conversion
+        if ENABLE_NAN_DEBUGGING:
+            print(f"\n{'='*60}")
+            print(f"Checking embeddings after conversion to {transformer.dtype}")
+            print(f"{'='*60}")
+            if torch.isnan(llama_vec).any():
+                nan_count = torch.isnan(llama_vec).sum().item()
+                print(f"⚠ llama_vec has {nan_count} NaN after .to({transformer.dtype})!")
+            else:
+                print(f"✓ llama_vec clean (shape: {llama_vec.shape})")
+
+            if torch.isnan(clip_l_pooler).any():
+                nan_count = torch.isnan(clip_l_pooler).sum().item()
+                print(f"⚠ clip_l_pooler has {nan_count} NaN after .to({transformer.dtype})!")
+            else:
+                print(f"✓ clip_l_pooler clean (shape: {clip_l_pooler.shape})")
+
+            if torch.isnan(image_encoder_last_hidden_state).any():
+                nan_count = torch.isnan(image_encoder_last_hidden_state).sum().item()
+                print(f"⚠ image_encoder_last_hidden_state has {nan_count} NaN after .to({transformer.dtype})!")
+            else:
+                print(f"✓ image_encoder_last_hidden_state clean (shape: {image_encoder_last_hidden_state.shape})")
+            print(f"{'='*60}\n")
 
         # Sampling
 
@@ -1750,12 +1614,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 latent_paddings_list = list(latent_paddings)
                 if latent_paddings_list and latent_padding == latent_paddings_list[0]:
                     log_memory_status(gpu, prefix="[Before Transformer Load] ")
-                move_model_to_device_with_memory_preservation(
-                    transformer,
-                    target_device=gpu,
-                    preserved_memory_gb=gpu_memory_preservation,
-                    optim_config=memory_optim_config if USE_MEMORY_OPTIMIZATIONS else None
-                )
+                move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
 
             if use_teacache:
                 transformer.initialize_teacache(enable_teacache=True, num_steps=steps)
@@ -1876,9 +1735,22 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
     # Print MIOpen fallback statistics
     MIOpenFallbackHandler.print_stats()
 
-    # Print tritonBLAS statistics if enabled
-    if USE_TRITONBLAS:
-        print_tritonblas_stats()
+    # Print NaN detection summary
+    if ENABLE_NAN_DEBUGGING:
+        print("\n" + "="*80)
+        print("NaN DETECTION SUMMARY")
+        print("="*80)
+        if nan_first_detected['layer'] is not None:
+            print(f"⚠ NaN FIRST DETECTED IN: {nan_first_detected['layer']}")
+            stats = nan_first_detected['stats']
+            if stats:
+                print(f"  Shape: {stats['shape']}")
+                print(f"  Dtype: {stats['dtype']}")
+                print(f"  NaN count: {stats['nan_count']:,} ({100*stats['nan_count']/(stats['nan_count']+1):.2f}%)")
+                print(f"  This is likely the root cause of black/corrupted output!")
+        else:
+            print("✓ No NaN values detected during generation")
+        print("="*80 + "\n")
 
     stream.output_queue.push(('end', None))
     return
@@ -2007,7 +1879,6 @@ with block:
 block.launch(
     server_name=args.server,
     server_port=args.port,
-    share=False,  # OFFLINE MODE: Disable sharing
+    share=args.share,
     inbrowser=args.inbrowser,
-    show_api=False,  # Disable API documentation endpoint
 )
