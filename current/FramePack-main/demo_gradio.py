@@ -74,6 +74,7 @@ import safetensors.torch as sf
 import numpy as np
 import argparse
 import math
+from typing import Optional
 
 
 # last set if errors occurs this is the reason 
@@ -87,6 +88,30 @@ print("✓ Mixed precision mode: medium (5-10% gain)")
 # Initialize MIOpen fallback system for AMD GPUs (before any torch operations)
 from diffusers_helper.miopen_fallback import initialize_miopen_fallback, MIOpenFallbackHandler
 initialize_miopen_fallback(use_monkey_patch=True, verbose=True)
+
+# Apply AMD TransformerEngine optimizations for better performance on ROCm
+try:
+    from diffusers_helper.amd_te_monkey_patch import (
+        apply_amd_te_optimizations,
+        convert_model_to_te,
+        get_fp8_context,
+        HAS_AMD_TE
+    )
+    _te_optimization_results = apply_amd_te_optimizations(
+        verbose=True,
+        enable_fp8=False,
+        patch_layers=True,  # Don't patch globally, we'll convert models explicitly
+    )
+    _fp8_recipe = _te_optimization_results.get('fp8_recipe', None)
+except ImportError as e:
+    print(f"AMD TransformerEngine optimizations not available: {e}")
+    HAS_AMD_TE = False
+    _fp8_recipe = None
+    convert_model_to_te = lambda model, **kwargs: model  # No-op fallback
+
+    # Create dummy context manager
+    from contextlib import nullcontext
+    get_fp8_context = lambda **kwargs: nullcontext()
 
 # Prevent diffusers from importing bitsandbytes (AMD ROCm compatibility)
 # The AMD ROCm version of bitsandbytes lacks CPUBackend and CUDABackend which diffusers expects
@@ -189,6 +214,9 @@ def _env_flag(name: str, default: str = '0') -> bool:
 
 # Bitsandbytes 8-bit optimization configuration (AMD ROCm compatible)
 USE_BITSANDBYTES = _env_flag('FRAMEPACK_USE_BITSANDBYTES', '1')  # Enabled by default
+
+# AMD TransformerEngine optimization configuration
+USE_AMD_TE = _env_flag('FRAMEPACK_USE_AMD_TE', '0')  # Disabled by default (experimental)
 
 
 def get_quantization_config():
@@ -911,6 +939,16 @@ vae = configure_vae_inference(vae, target_device=gpu, apply_compile=True)
 if ENABLE_VAE_TILING:
     vae.enable_tiling()
 
+# Optionally convert transformer to AMD TransformerEngine for better performance
+if USE_AMD_TE and HAS_AMD_TE and IS_HIP_RUNTIME:
+    print('\nConverting Transformer to AMD TransformerEngine...')
+    try:
+        transformer = convert_model_to_te(transformer, verbose=True)
+        print('✓ Transformer converted to AMD TE')
+    except Exception as e:
+        print(f'⚠ Failed to convert Transformer to AMD TE: {e}')
+        print('  Continuing with standard PyTorch implementation')
+
 if high_vram:
     # torch.compile currently only makes sense when the transformer can stay resident on the GPU
     transformer = maybe_torch_compile(transformer, 'Hunyuan Transformer')
@@ -921,6 +959,94 @@ stream = None  # Will be initialized per generation
 
 outputs_folder = './outputs/'
 os.makedirs(outputs_folder, exist_ok=True)
+
+# REST API configuration for latent processing
+LATENT_API_ENABLED = _env_flag('FRAMEPACK_LATENT_API_ENABLED', '1')  # Disabled by default
+LATENT_API_URL = os.environ.get('FRAMEPACK_LATENT_API_URL', 'http://localhost:7861')  # Different port from gradio
+
+
+def send_latents_to_api(latents_file: str, job_id: str, verbose: bool = True) -> Optional[str]:
+    """
+    Send saved latents to REST API for final video generation.
+
+    Args:
+        latents_file: Path to saved latents .pt file
+        job_id: Job identifier
+        verbose: Print verbose output
+
+    Returns:
+        Path to final generated video or None on failure
+    """
+    try:
+        import requests
+
+        if verbose:
+            print(f'\n{"="*60}')
+            print(f'Sending latents to API for final video generation')
+            print(f'  API URL: {LATENT_API_URL}')
+            print(f'  Latents file: {latents_file}')
+            print(f'{"="*60}')
+
+        # Prepare request payload
+        payload = {
+            'latents_path': latents_file,
+            'output_name': f'{job_id}_final.mp4',
+            'enable_slicing': False,
+            'verbose': verbose
+        }
+
+        # Send POST request to API
+        response = requests.post(
+            f'{LATENT_API_URL}/process',
+            json=payload,
+            timeout=300  # 5 minute timeout
+        )
+
+        if response.status_code == 200:
+            result = response.json()
+            output_path = result.get('output_path')
+
+            if verbose:
+                print(f'\n✓ API processing successful!')
+                print(f'  Output: {output_path}')
+                print(f'  Total frames: {result.get("total_frames")}')
+                print(f'  Duration: {result.get("duration")} seconds')
+                print(f'  Resolution: {result.get("resolution")}')
+                print(f'  Processing time: {result.get("processing_time"):.2f}s')
+                print(f'{"="*60}\n')
+
+            # Ensure the path is absolute for Gradio to find it
+            if output_path and not os.path.isabs(output_path):
+                output_path = os.path.abspath(output_path)
+
+            return output_path
+        else:
+            error_msg = f'API returned error: {response.status_code}'
+            try:
+                error_detail = response.json()
+                error_msg = f'{error_msg} - {error_detail.get("message", "Unknown error")}'
+            except:
+                pass
+
+            if verbose:
+                print(f'✗ {error_msg}')
+            return None
+
+    except requests.exceptions.ConnectionError:
+        if verbose:
+            print(f'✗ Failed to connect to API at {LATENT_API_URL}')
+            print(f'  Make sure the API server is running:')
+            print(f'  python process_saved_latents_api.py --port 7861')
+        return None
+    except requests.exceptions.Timeout:
+        if verbose:
+            print(f'✗ API request timed out (>300s)')
+        return None
+    except Exception as e:
+        if verbose:
+            print(f'✗ Error communicating with API: {e}')
+        return None
+
 
 def flush_rocm_allocator(stage: str = '', min_resident_gb: float = 0.0) -> bool:
     """Force ROCm/HIP BlockAllocator to release cached blocks back to the driver."""
@@ -1231,6 +1357,18 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         if latents_file:
             print(f'Latent segments saved to {latents_file}')
             stream.output_queue.push(('latents', latents_file))
+
+            # Send to REST API for final video generation if enabled
+            if LATENT_API_ENABLED:
+                stream.output_queue.push(('progress', (None, 'Sending latents to API for final video generation...', make_progress_bar_html(95, 'Generating final video'))))
+                try:
+                    final_video = send_latents_to_api(latents_file, job_id, verbose=True)
+                    if final_video:
+                        print(f'Final video received from API: {final_video}')
+                        stream.output_queue.push(('final_video', final_video))
+                except Exception as e:
+                    print(f'Warning: Failed to process latents via API: {e}')
+                    traceback.print_exc()
     except:
         traceback.print_exc()
     finally:
@@ -1290,10 +1428,23 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
                 output_filename = data
                 # Force video component to update by providing explicit value
                 yield gr.update(value=output_filename), gr.update(), gr.update(), gr.update(), gr.update(interactive=False), gr.update(interactive=True)
+
             if flag == 'latents':
-                output_filename = data
-                desc = f'Latent segments saved to {os.path.basename(output_filename)}'
+                # Don't update output_filename here - latents are not a video file
+                # The final_video flag will set the proper output_filename
+                latents_filename = data
+                desc = f'Latent segments saved to {os.path.basename(latents_filename)}'
                 yield gr.update(value=None), gr.update(visible=False), desc, '', gr.update(interactive=False), gr.update(interactive=True)
+
+            if flag == 'final_video':
+                # Final video from API - this is the complete video
+                # Update output_filename so the 'end' flag handler will use this video
+                output_filename = data
+                desc = f'✓ Final video generated: {os.path.basename(output_filename)}'
+                print(f'[DEBUG] Displaying final video: {output_filename}')
+                print(f'[DEBUG] File exists: {os.path.exists(output_filename)}')
+                # Update video component with the final video
+                yield gr.update(value=output_filename), gr.update(visible=False), desc, '', gr.update(interactive=False), gr.update(interactive=True)
 
             if flag == 'progress':
                 preview, desc, html = data
