@@ -159,19 +159,78 @@ def _enable_fp8_optimizations(enabled: bool = True, verbose: bool = False):
         return None
 
 
-def convert_model_to_te(model: nn.Module, verbose: bool = False) -> nn.Module:
+class _DTypeSafeLinearWrapper(nn.Module):
+    """
+    Wrapper for TE Linear that handles dtype mismatches.
+
+    TE Linear enforces strict dtype matching (input.dtype == weight.dtype).
+    This wrapper casts inputs to the correct dtype before forward pass.
+    """
+    def __init__(self, te_linear_module, target_dtype):
+        super().__init__()
+        self.te_linear = te_linear_module
+        self.target_dtype = target_dtype
+
+    def forward(self, input):
+        # Cast input to target dtype if needed
+        if input.dtype != self.target_dtype:
+            input = input.to(dtype=self.target_dtype)
+
+        # Call TE Linear with correct dtype
+        return self.te_linear(input)
+
+    @property
+    def weight(self):
+        """Forward weight access to wrapped TE Linear"""
+        return self.te_linear.weight
+
+    @property
+    def bias(self):
+        """Forward bias access to wrapped TE Linear"""
+        return self.te_linear.bias if hasattr(self.te_linear, 'bias') else None
+
+    @property
+    def in_features(self):
+        """Forward in_features access to wrapped TE Linear"""
+        return self.te_linear.in_features
+
+    @property
+    def out_features(self):
+        """Forward out_features access to wrapped TE Linear"""
+        return self.te_linear.out_features
+
+    def __getattr__(self, name):
+        # Forward attribute access to the wrapped TE Linear
+        # This is called only when the attribute is not found in the wrapper
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.te_linear, name)
+
+
+def convert_model_to_te(
+    model: nn.Module,
+    verbose: bool = False,
+    cache_path: Optional[str] = None,
+    force_convert: bool = False
+) -> nn.Module:
     """
     Convert existing PyTorch model layers to TransformerEngine equivalents
 
-    This function walks through a model and replaces nn.Linear and nn.LayerNorm
-    with their TE counterparts for better performance.
+    Now includes dtype-safe wrappers to handle mixed-precision models (BF16/FP32).
+
+    The wrapper automatically casts inputs to match weight dtype, preventing
+    the AssertionError that occurs with strict dtype checking in TE.
 
     Args:
         model: PyTorch model to convert
         verbose: Print conversion progress
+        cache_path: Optional path to save/load cached converted model
+                   (default: .cache_rocm/te_models/transformer_te.pt)
+        force_convert: Force re-conversion even if cached model exists
 
     Returns:
-        Modified model with TE layers
+        Modified model with TE layers (or original model if conversion fails)
     """
     if not HAS_AMD_TE:
         if verbose:
@@ -183,6 +242,44 @@ def convert_model_to_te(model: nn.Module, verbose: bool = False) -> nn.Module:
             print("Skipping TE conversion: Not on AMD ROCm")
         return model
 
+    import os
+    import hashlib
+
+    # CACHING DISABLED - Causes issues with wrapper state dict keys
+    # TODO: Fix caching to work with _DTypeSafeLinearWrapper
+    # Set default cache path if not provided
+    # if cache_path is None:
+    #     cache_dir = os.path.join(os.getcwd(), '.cache_rocm', 'te_models')
+    #     os.makedirs(cache_dir, exist_ok=True)
+    #     cache_path = os.path.join(cache_dir, 'transformer_te.pt')
+
+    # Try to load cached converted model
+    cache_exists = False  # Disabled
+    cached_state = None
+    using_cache = False
+
+    # if cache_exists and not force_convert:
+    #     try:
+    #         if verbose:
+    #             print(f"Found cached TE model at {cache_path}")
+
+    #         # Load the cached state dict
+    #         cached_state = torch.load(cache_path, map_location='cpu')
+    #         using_cache = True
+
+    #         # We still need to convert the model structure first
+    #         # (TE layers have different structure than nn.Linear/LayerNorm)
+    #         # But we can skip weight copying since we'll load from cache
+    #         if verbose:
+    #             print("Converting model structure to TE...")
+
+    #     except Exception as e:
+    #         if verbose:
+    #             print(f"Failed to load cache: {e}")
+    #             print("Will perform full conversion...")
+    #         cached_state = None
+    #         using_cache = False
+
     converted_count = 0
 
     def _convert_layer(module: nn.Module, name: str = '') -> Optional[nn.Module]:
@@ -192,27 +289,33 @@ def convert_model_to_te(model: nn.Module, verbose: bool = False) -> nn.Module:
         # Convert nn.Linear to TE Linear
         if isinstance(module, nn.Linear) and not isinstance(module, TELinear):
             try:
-                # Create TE Linear - TE modules don't accept dtype/device in __init__
-                # They will be set when we copy weights
+                # Create TE Linear with dtype-safe wrapper
                 te_linear = TELinear(
                     in_features=module.in_features,
                     out_features=module.out_features,
                     bias=module.bias is not None,
+                    params_dtype=module.weight.dtype,  # Set dtype for TE
                 )
 
-                # Move to same device and dtype, then copy weights
-                te_linear = te_linear.to(device=module.weight.device, dtype=module.weight.dtype)
+                # Move to same device
+                te_linear = te_linear.to(device=module.weight.device)
 
+                # Always copy weights from original model to initialize TE layer
+                # (These will be overwritten by cache if cache is being used)
                 with torch.no_grad():
                     te_linear.weight.copy_(module.weight)
                     if module.bias is not None:
                         te_linear.bias.copy_(module.bias)
 
+                # Wrap with dtype-safe wrapper to handle mixed precision
+                te_linear_wrapped = _DTypeSafeLinearWrapper(te_linear, target_dtype=module.weight.dtype)
+
                 converted_count += 1
                 if verbose:
-                    print(f"  Converted {name} (Linear {module.in_features}→{module.out_features})")
+                    if not using_cache:
+                        print(f"  Converted {name} (Linear {module.in_features}→{module.out_features})")
 
-                return te_linear
+                return te_linear_wrapped
             except Exception as e:
                 if verbose:
                     print(f"  Failed to convert {name}: {e}")
@@ -226,14 +329,18 @@ def convert_model_to_te(model: nn.Module, verbose: bool = False) -> nn.Module:
                 if isinstance(normalized_shape, int):
                     normalized_shape = (normalized_shape,)
 
+                # Create TE LayerNorm - TE modules don't accept dtype/device in __init__
                 te_layernorm = TELayerNorm(
                     hidden_size=normalized_shape[-1],
                     eps=module.eps,
-                    device=module.weight.device if module.weight is not None else None,
-                    dtype=module.weight.dtype if module.weight is not None else torch.float32,
                 )
 
-                # Copy weights and bias
+                # Move to same device and dtype as original
+                if module.weight is not None:
+                    te_layernorm = te_layernorm.to(device=module.weight.device, dtype=module.weight.dtype)
+
+                # Always copy weights from original model to initialize TE layer
+                # (These will be overwritten by cache if cache is being used)
                 if module.weight is not None:
                     with torch.no_grad():
                         te_layernorm.weight.copy_(module.weight)
@@ -243,7 +350,8 @@ def convert_model_to_te(model: nn.Module, verbose: bool = False) -> nn.Module:
 
                 converted_count += 1
                 if verbose:
-                    print(f"  Converted {name} (LayerNorm {normalized_shape})")
+                    if not using_cache:
+                        print(f"  Converted {name} (LayerNorm {normalized_shape})")
 
                 return te_layernorm
             except Exception as e:
@@ -253,9 +361,17 @@ def convert_model_to_te(model: nn.Module, verbose: bool = False) -> nn.Module:
 
         return None
 
-    # Walk through all modules and convert
+    # Walk through all modules and convert structure
+    # NOTE: This MUST happen every time, even with cache, because:
+    # - Models are always loaded from disk as PyTorch nn.Linear/LayerNorm
+    # - We can't pickle/save TE layer class instances directly
+    # - We can only cache the weights, not the class structure
+    # - Cache saves time by skipping weight copying (done after conversion)
     if verbose:
-        print(f"\nConverting model to TransformerEngine layers...")
+        if using_cache:
+            print(f"\nConverting model structure to TE (weights will be loaded from cache)...")
+        else:
+            print(f"\nConverting model to TransformerEngine layers...")
 
     for name, module in list(model.named_modules()):
         if name == '':  # Skip root module
@@ -280,6 +396,62 @@ def convert_model_to_te(model: nn.Module, verbose: bool = False) -> nn.Module:
             print(f"✓ Converted {converted_count} layers to TransformerEngine")
         else:
             print("  No layers converted")
+
+    # CACHING DISABLED - Commented out until wrapper state dict issues are resolved
+    # # Load cached weights if available
+    # if using_cache and cached_state is not None and converted_count > 0:
+    #     try:
+    #         if verbose:
+    #             print(f"Loading cached weights into converted model...")
+
+    #         # Load weights from cache into the converted structure
+    #         # Use strict=False to allow for wrapper structure differences
+    #         missing_keys, unexpected_keys = model.load_state_dict(cached_state, strict=False)
+
+    #         # Filter out expected missing/unexpected keys from the wrapper
+    #         # The wrapper adds 'te_linear' and 'target_dtype' attributes
+    #         unexpected_keys = [k for k in unexpected_keys if not any(
+    #             x in k for x in ['te_linear', 'target_dtype', '_DTypeSafeLinearWrapper']
+    #         )]
+    #         missing_keys = [k for k in missing_keys if not any(
+    #             x in k for x in ['te_linear', 'target_dtype', '_DTypeSafeLinearWrapper']
+    #         )]
+
+    #         if verbose:
+    #             cache_size_mb = os.path.getsize(cache_path) / (1024 * 1024)
+    #             print(f"✓ Cached weights loaded successfully ({cache_size_mb:.1f} MB)")
+    #             if missing_keys:
+    #                 print(f"  Warning: {len(missing_keys)} keys not found in cache")
+    #             if unexpected_keys:
+    #                 print(f"  Warning: {len(unexpected_keys)} unexpected keys in cache")
+
+    #     except Exception as e:
+    #         if verbose:
+    #             print(f"⚠ Failed to load cached weights: {e}")
+    #             print(f"  Model will use random initialization (this will fail!)")
+    #             print(f"  Delete cache and restart: {cache_path}")
+    #         # This is a critical error - cached model structure but failed to load weights
+    #         # Return original model to avoid running with uninitialized weights
+    #         return model
+
+    # # Save converted model to cache (only if not using cache)
+    # if converted_count > 0 and cache_path and not using_cache:
+    #     try:
+    #         if verbose:
+    #             print(f"Saving converted model to cache: {cache_path}")
+
+    #         # Save the full state dict
+    #         torch.save(model.state_dict(), cache_path)
+
+    #         if verbose:
+    #             cache_size_mb = os.path.getsize(cache_path) / (1024 * 1024)
+    #             print(f"✓ Cache saved ({cache_size_mb:.1f} MB)")
+    #             print(f"  Next startup: Structure conversion + cached weight loading (faster)")
+
+    #     except Exception as e:
+    #         if verbose:
+    #             print(f"⚠ Failed to save cache: {e}")
+    #             print("  This won't affect current session, but next startup will be slower")
 
     return model
 

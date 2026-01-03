@@ -585,6 +585,15 @@ class HunyuanVideoSingleTransformerBlock(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
+        # Ensure hidden states align with module parameter dtype to avoid Float/BFloat16 mismatches.
+        block_dtype = self.proj_mlp.weight.dtype
+        if hidden_states.dtype != block_dtype:
+            hidden_states = hidden_states.to(block_dtype)
+        if encoder_hidden_states.dtype != block_dtype:
+            encoder_hidden_states = encoder_hidden_states.to(block_dtype)
+        if temb.dtype != block_dtype:
+            temb = temb.to(block_dtype)
+
         text_seq_length = encoder_hidden_states.shape[1]
         hidden_states = torch.cat([hidden_states, encoder_hidden_states], dim=1)
 
