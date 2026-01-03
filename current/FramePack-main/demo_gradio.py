@@ -75,6 +75,15 @@ import numpy as np
 import argparse
 import math
 
+
+# last set if errors occurs this is the reason 
+# Mixed Precision Optimization
+torch.set_float32_matmul_precision('medium')  # Use TF32/FP16 where beneficial
+# not available on AMD
+torch.backends.cudnn.allow_tf32 = False
+print("✓ Mixed precision mode: medium (5-10% gain)")
+
+
 # Initialize MIOpen fallback system for AMD GPUs (before any torch operations)
 from diffusers_helper.miopen_fallback import initialize_miopen_fallback, MIOpenFallbackHandler
 initialize_miopen_fallback(use_monkey_patch=True, verbose=True)
@@ -109,19 +118,6 @@ try:
 except ImportError:
     print("Note: torch_migraphx not installed. Using standard torch backends.")
     print("Install with: pip install torch_migraphx for AMD ROCm optimizations.")
-
-# Try to import Transformer Engine for FP8 optimization on AMD ROCm
-# This provides an alternative to bitsandbytes with native FP8 support on MI300 GPUs
-HAS_TRANSFORMER_ENGINE = False
-try:
-    import transformer_engine.pytorch as te
-    from transformer_engine.common.recipe import Format, DelayedScaling
-    HAS_TRANSFORMER_ENGINE = True
-    print("Transformer Engine available - FP8 optimization enabled for AMD MI300 GPUs")
-except ImportError:
-    print("Note: Transformer Engine not installed. Using bitsandbytes or full precision.")
-    print("Install with: pip install transformer_engine for AMD ROCm FP8 optimizations.")
-    print("See: cache/TransformerEngine-dev/README.rst for installation instructions.")
 
 # Try to import the real bitsandbytes for our use (AMD ROCm version has limitations)
 # IMPORTANT: Import AFTER diffusers to avoid CPUBackend compatibility issues during diffusers init
@@ -192,18 +188,7 @@ def _env_flag(name: str, default: str = '0') -> bool:
     return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
 
 # Bitsandbytes 8-bit optimization configuration (AMD ROCm compatible)
-USE_BITSANDBYTES = _env_flag('FRAMEPACK_USE_BITSANDBYTES', '0')  # Enabled by default
-
-# Transformer Engine optimization configuration (AMD ROCm compatible)
-# Note: TE and Bitsandbytes are mutually exclusive - TE takes priority if both are enabled
-# TE provides optimized kernels even without FP8 (works on RX 7900, MI200, MI300)
-USE_TRANSFORMER_ENGINE = _env_flag('FRAMEPACK_USE_TRANSFORMER_ENGINE', '1')  # Disabled by default
-USE_TRANSFORMER_ENGINE_FP8 = _env_flag('FRAMEPACK_USE_TRANSFORMER_ENGINE_FP8', '0')  # Only enable on MI300+
-USE_TRANSFORMER_ENGINE_CACHE = _env_flag('FRAMEPACK_USE_TRANSFORMER_ENGINE_CACHE', '1')  # Cache converted models for faster startup
-if USE_TRANSFORMER_ENGINE and USE_BITSANDBYTES:
-    print("Note: Both Transformer Engine and Bitsandbytes are enabled.")
-    print("  Transformer Engine will be used (takes priority)")
-    USE_BITSANDBYTES = False
+USE_BITSANDBYTES = _env_flag('FRAMEPACK_USE_BITSANDBYTES', '1')  # Enabled by default
 
 
 def get_quantization_config():
@@ -227,259 +212,6 @@ def get_quantization_config():
     except Exception as e:
         print(f"  ⚠ Failed to create quantization config: {e}")
         return None
-
-
-def get_te_fp8_recipe():
-    """
-    Create Transformer Engine FP8 recipe for AMD ROCm MI300 GPUs.
-
-    Only creates recipe if FP8 is explicitly enabled (MI300+ GPUs only).
-    For other GPUs (RX 7900, MI200), TE works without FP8.
-
-    Returns:
-        DelayedScaling recipe for FP8 inference or None if FP8 disabled/not available
-    """
-    if not HAS_TRANSFORMER_ENGINE or not USE_TRANSFORMER_ENGINE_FP8:
-        return None
-
-    try:
-        # Use HYBRID format for best compatibility on AMD MI300
-        # E4M3 for forward pass, E5M2 for gradients
-        fp8_format = Format.HYBRID
-
-        # Recipe configuration optimized for inference
-        fp8_recipe = DelayedScaling(
-            fp8_format=fp8_format,
-            amax_history_len=16,  # Shorter history for inference
-            amax_compute_algo="max",  # Use max for stability
-            override_linear_precision=(False, False, False)  # Let TE decide precision
-        )
-        print("  Created Transformer Engine FP8 recipe (AMD MI300)")
-        return fp8_recipe
-    except Exception as e:
-        print(f"  ⚠ Failed to create TE FP8 recipe: {e}")
-        return None
-
-
-def get_te_cache_path(model_name: str) -> str:
-    """
-    Get the cache path for a TE-converted model.
-
-    Args:
-        model_name: Name of the model (e.g., "text_encoder", "text_encoder_2")
-
-    Returns:
-        Path to cached model file
-    """
-    cache_dir = os.path.join(os.path.dirname(__file__), '.cache_rocm', 'te_models')
-    os.makedirs(cache_dir, exist_ok=True)
-    return os.path.join(cache_dir, f'{model_name}.safetensors')
-
-
-def save_te_model_cache(model: torch.nn.Module, model_name: str, verbose: bool = True):
-    """
-    Save TE-converted model to cache for faster loading next time.
-
-    Args:
-        model: Converted model with TE Linear layers
-        model_name: Name for cache file
-        verbose: Whether to print save status
-    """
-    if not HAS_TRANSFORMER_ENGINE or not USE_TRANSFORMER_ENGINE:
-        return
-
-    try:
-        cache_path = get_te_cache_path(model_name)
-
-        # Save model state dict
-        state_dict = model.state_dict()
-        sf.save_file(state_dict, cache_path)
-
-        if verbose:
-            cache_size_mb = os.path.getsize(cache_path) / (1024**2)
-            print(f"    Cached {model_name} to {cache_path} ({cache_size_mb:.1f} MB)")
-    except Exception as e:
-        if verbose:
-            print(f"    ⚠ Failed to cache {model_name}: {e}")
-
-
-def check_te_cache_exists(model_name: str) -> bool:
-    """
-    Check if a cached TE model exists and is recent.
-
-    Args:
-        model_name: Name of the model
-
-    Returns:
-        True if cache exists and is less than 7 days old
-    """
-    if not HAS_TRANSFORMER_ENGINE or not USE_TRANSFORMER_ENGINE:
-        return False
-
-    cache_path = get_te_cache_path(model_name)
-
-    if not os.path.exists(cache_path):
-        return False
-
-    # Check cache age (invalidate after 7 days)
-    cache_age_days = (time.time() - os.path.getmtime(cache_path)) / (24 * 3600)
-    if cache_age_days > 7:
-        return False
-
-    return True
-
-
-def load_te_weights_from_cache(model: torch.nn.Module, model_name: str, verbose: bool = True) -> bool:
-    """
-    Load TE model weights from cache into an already-converted model.
-
-    This is called AFTER convert_model_to_te has replaced Linear layers with te.Linear.
-
-    Args:
-        model: Model with TE Linear layers (already converted)
-        model_name: Name of cached model
-        verbose: Whether to print load status
-
-    Returns:
-        True if weights were loaded successfully
-    """
-    cache_path = get_te_cache_path(model_name)
-
-    if not os.path.exists(cache_path):
-        return False
-
-    try:
-        if verbose:
-            cache_age_hours = (time.time() - os.path.getmtime(cache_path)) / 3600
-            print(f"    Loading weights from cache ({cache_age_hours:.1f} hours old)...")
-
-        # Load state dict from cache
-        state_dict = sf.load_file(cache_path)
-
-        # Load weights into already-converted model
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-
-        if verbose:
-            if missing or unexpected:
-                print(f"    ⚠ Cache mismatch: {len(missing)} missing, {len(unexpected)} unexpected keys")
-                return False
-            print(f"    ✓ Loaded weights from cache")
-
-        return True
-
-    except Exception as e:
-        if verbose:
-            print(f"    ⚠ Failed to load from cache: {e}")
-        return False
-
-
-def convert_model_to_te(model: torch.nn.Module, model_name: str, verbose: bool = True, use_cache: bool = True):
-    """
-    Convert a PyTorch model to use Transformer Engine Linear layers.
-    Supports caching to avoid re-loading weights on subsequent runs.
-
-    Args:
-        model: PyTorch model to convert (LlamaModel, CLIPTextModel, etc.)
-        model_name: Human-readable name for logging and caching
-        verbose: Whether to print conversion details
-        use_cache: Whether to use/create cached weights
-
-    Returns:
-        Converted model with TE Linear layers
-    """
-    if not HAS_TRANSFORMER_ENGINE or not USE_TRANSFORMER_ENGINE:
-        return model
-
-    # Check if we have cached weights
-    has_cache = use_cache and check_te_cache_exists(model_name)
-
-    # Perform conversion (structure replacement)
-    try:
-        num_replaced = 0
-        num_failed = 0
-
-        def replace_linear_recursive(module, prefix=""):
-            nonlocal num_replaced, num_failed
-
-            for name, child in module.named_children():
-                full_name = f"{prefix}.{name}" if prefix else name
-
-                if isinstance(child, nn.Linear):
-                    try:
-                        # Extract Linear layer properties
-                        in_features = child.in_features
-                        out_features = child.out_features
-                        bias = child.bias is not None
-                        device = child.weight.device
-                        dtype = child.weight.dtype
-
-                        # CRITICAL FIX: Force float16 for TE on AMD ROCm
-                        # bfloat16 + TE + AMD ROCm produces NaN, but float16 works
-                        te_dtype = torch.float16 if dtype == torch.bfloat16 else dtype
-
-                        # Create TE Linear layer
-                        te_linear = te.Linear(
-                            in_features=in_features,
-                            out_features=out_features,
-                            bias=bias,
-                            params_dtype=te_dtype,
-                            device=device,
-                        )
-
-                        # Copy weights from original layer (unless loading from cache)
-                        if not has_cache:
-                            with torch.no_grad():
-                                te_linear.weight.copy_(child.weight)
-                                if bias:
-                                    te_linear.bias.copy_(child.bias)
-
-                        # Replace the module
-                        setattr(module, name, te_linear)
-                        num_replaced += 1
-
-                        if verbose and not has_cache and num_replaced <= 5:  # Only print first few
-                            print(f"    ✓ {full_name}: Linear({in_features}, {out_features}) -> te.Linear")
-
-                    except Exception as e:
-                        num_failed += 1
-                        if verbose:
-                            print(f"    ✗ Failed {full_name}: {e}")
-                else:
-                    # Recursively process child modules
-                    replace_linear_recursive(child, full_name)
-
-        if verbose:
-            if has_cache:
-                print(f"  Converting {model_name} to Transformer Engine (loading cached weights)...")
-            else:
-                print(f"  Converting {model_name} to Transformer Engine...")
-
-        # Replace Linear layers with TE Linear layers
-        replace_linear_recursive(model)
-
-        if verbose and not has_cache:
-            print(f"  ✓ Converted {model_name}: {num_replaced} Linear layers -> te.Linear")
-            if num_failed > 0:
-                print(f"    ⚠ Failed to convert {num_failed} layers")
-
-        # Load weights from cache if available
-        if has_cache:
-            cache_loaded = load_te_weights_from_cache(model, model_name, verbose)
-            if not cache_loaded:
-                # Cache load failed, we already have weights from original model
-                if verbose:
-                    print(f"    Using original weights (cache load failed)")
-        else:
-            # Save to cache for next time
-            if use_cache and num_replaced > 0:
-                save_te_model_cache(model, model_name, verbose)
-
-        return model
-
-    except Exception as e:
-        print(f"  ✗ Failed to convert {model_name} to TE: {e}")
-        print(f"    Using original model")
-        return model
 
 
 free_mem_gb = get_cuda_free_memory_gb(gpu)
@@ -597,165 +329,39 @@ def load_model_with_fallback(model_class, model_name, subfolder=None, dtype=torc
     return model
 
 
-# Create quantization config for AMD ROCm bitsandbytes or TE FP8
+# Create quantization config for AMD ROCm bitsandbytes
 quantization_config = get_quantization_config()
-te_fp8_recipe = get_te_fp8_recipe() if USE_TRANSFORMER_ENGINE else None
 
-# ===== NaN Debugging System =====
-# Enable this to track where NaN values first appear during generation
-ENABLE_NAN_DEBUGGING = _env_flag('FRAMEPACK_DEBUG_NAN', '1')  # Enabled by default to diagnose black output
-
-# Global state for NaN debugging
-nan_debug_hooks = []
-nan_first_detected = {'layer': None, 'step': None, 'stats': None}
-
-def register_nan_debug_hooks(model, prefix="model"):
-    """
-    Register forward hooks on all layers to detect NaN values.
-
-    This helps identify exactly where NaN values first appear in the forward pass.
-    """
-    global nan_debug_hooks, nan_first_detected
-
-    if not ENABLE_NAN_DEBUGGING:
-        return
-
-    def make_hook(layer_name):
-        def hook_fn(module, input, output):
-            # Skip if we've already found the first NaN
-            if nan_first_detected['layer'] is not None:
-                return
-
-            # Check output for NaN
-            if isinstance(output, torch.Tensor):
-                tensors_to_check = [output]
-            elif isinstance(output, (tuple, list)):
-                tensors_to_check = [t for t in output if isinstance(t, torch.Tensor)]
-            else:
-                return
-
-            for tensor in tensors_to_check:
-                if torch.isnan(tensor).any():
-                    nan_count = torch.isnan(tensor).sum().item()
-                    inf_count = torch.isinf(tensor).sum().item()
-
-                    stats = {
-                        'layer': layer_name,
-                        'shape': tuple(tensor.shape),
-                        'dtype': str(tensor.dtype),
-                        'device': str(tensor.device),
-                        'nan_count': nan_count,
-                        'inf_count': inf_count,
-                        'min': tensor[~torch.isnan(tensor)].min().item() if (~torch.isnan(tensor)).any() else float('nan'),
-                        'max': tensor[~torch.isnan(tensor)].max().item() if (~torch.isnan(tensor)).any() else float('nan'),
-                        'mean': tensor[~torch.isnan(tensor)].mean().item() if (~torch.isnan(tensor)).any() else float('nan'),
-                    }
-
-                    nan_first_detected['layer'] = layer_name
-                    nan_first_detected['stats'] = stats
-
-                    print(f"\n{'='*80}")
-                    print(f"NaN DETECTED IN LAYER: {layer_name}")
-                    print(f"{'='*80}")
-                    print(f"  Shape: {stats['shape']}")
-                    print(f"  Dtype: {stats['dtype']}")
-                    print(f"  Device: {stats['device']}")
-                    print(f"  NaN count: {nan_count:,} ({100*nan_count/tensor.numel():.2f}%)")
-                    print(f"  Inf count: {inf_count:,}")
-                    print(f"  Valid values - min: {stats['min']:.6f}, max: {stats['max']:.6f}, mean: {stats['mean']:.6f}")
-                    print(f"{'='*80}\n")
-
-                    # Also check input tensors to see if NaN came from input
-                    if isinstance(input, torch.Tensor):
-                        input_tensors = [input]
-                    elif isinstance(input, (tuple, list)):
-                        input_tensors = [t for t in input if isinstance(t, torch.Tensor)]
-                    else:
-                        input_tensors = []
-
-                    for idx, in_tensor in enumerate(input_tensors):
-                        if torch.isnan(in_tensor).any():
-                            print(f"  WARNING: Input tensor {idx} also contains NaN!")
-                        else:
-                            print(f"  Input tensor {idx}: clean (no NaN)")
-
-                    break  # Only report first NaN occurrence
-
-        return hook_fn
-
-    # Register hooks on all modules
-    for name, module in model.named_modules():
-        if name:  # Skip root module
-            full_name = f"{prefix}.{name}"
-            hook = module.register_forward_hook(make_hook(full_name))
-            nan_debug_hooks.append(hook)
-
-    print(f"Registered {len(nan_debug_hooks)} NaN debugging hooks on {prefix}")
-
-def clear_nan_debug_hooks():
-    """Remove all NaN debugging hooks"""
-    global nan_debug_hooks, nan_first_detected
-    for hook in nan_debug_hooks:
-        hook.remove()
-    nan_debug_hooks = []
-    nan_first_detected = {'layer': None, 'step': None, 'stats': None}
-
-def reset_nan_detection():
-    """Reset NaN detection state (call before each generation)"""
-    global nan_first_detected
-    nan_first_detected = {'layer': None, 'step': None, 'stats': None}
-
-# ===== End NaN Debugging System =====
-
-if USE_TRANSFORMER_ENGINE and HAS_TRANSFORMER_ENGINE:
-    if USE_TRANSFORMER_ENGINE_FP8:
-        print("\nUsing Transformer Engine with FP8 optimization (AMD MI300)...")
-        print("Note: Models will be loaded in FP16, then converted to TE with FP8 support.\n")
-    else:
-        print("\nUsing Transformer Engine with optimized kernels (AMD ROCm)...")
-        print("Note: Models will be loaded in FP16, then converted to TE (FP8 disabled for RX 7900 compatibility).\n")
-elif quantization_config is not None:
+if quantization_config is not None:
     print("\nAttempting to load models with 8-bit quantization...")
     print("Note: Will fall back to full precision if quantization fails for any model.\n")
 else:
     print("\nLoading models in full precision...\n")
 
-if ENABLE_NAN_DEBUGGING:
-    print("⚠ NaN debugging enabled - will track where NaN values first appear")
-    print("  Set FRAMEPACK_DEBUG_NAN=0 to disable\n")
-
 # Load models with automatic fallback to full precision if quantization fails
-# For TE, we load in FP16 first, then convert Linear layers to TE
 text_encoder = load_model_with_fallback(
     LlamaModel,
     "hunyuanvideo-community/HunyuanVideo",
     subfolder='text_encoder',
     dtype=torch.float16,
-    quantization_config=quantization_config if not USE_TRANSFORMER_ENGINE else None
+    quantization_config=quantization_config
 )
-# SKIP TE conversion for text encoder - it produces NaN outputs on AMD ROCm
-# Only convert transformer (the main model) to TE for better performance
-print("  Skipping TE conversion for text_encoder (causes NaN on AMD ROCm)")
 
 text_encoder_2 = load_model_with_fallback(
     CLIPTextModel,
     "hunyuanvideo-community/HunyuanVideo",
     subfolder='text_encoder_2',
     dtype=torch.float16,
-    quantization_config=quantization_config if not USE_TRANSFORMER_ENGINE else None
+    quantization_config=quantization_config
 )
-# SKIP TE conversion for text encoder 2 - it produces NaN outputs on AMD ROCm
-print("  Skipping TE conversion for text_encoder_2 (causes NaN on AMD ROCm)")
 
 image_encoder = load_model_with_fallback(
     SiglipVisionModel,
     "lllyasviel/flux_redux_bfl",
     subfolder='image_encoder',
     dtype=torch.float16,
-    quantization_config=quantization_config if not USE_TRANSFORMER_ENGINE else None
+    quantization_config=quantization_config
 )
-# SKIP TE conversion for image encoder - it produces NaN outputs on AMD ROCm
-print("  Skipping TE conversion for image_encoder (causes NaN on AMD ROCm)")
 
 tokenizer = LlamaTokenizerFast.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer')
 tokenizer_2 = CLIPTokenizer.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder='tokenizer_2')
@@ -775,11 +381,6 @@ transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained(
     'lllyasviel/FramePackI2V_HY',
     torch_dtype=torch.bfloat16
 ).cpu()
-
-# Convert transformer to Transformer Engine if enabled
-if USE_TRANSFORMER_ENGINE and HAS_TRANSFORMER_ENGINE:
-    print("  Converting transformer to Transformer Engine...")
-    transformer = convert_model_to_te(transformer, "transformer", verbose=True, use_cache=USE_TRANSFORMER_ENGINE_CACHE)
 
 print("\nModel loading complete.\n")
 
@@ -806,14 +407,6 @@ text_encoder.requires_grad_(False)
 text_encoder_2.requires_grad_(False)
 image_encoder.requires_grad_(False)
 transformer.requires_grad_(False)
-
-# Register NaN debugging hooks if enabled
-if ENABLE_NAN_DEBUGGING:
-    print("\n" + "="*60)
-    print("Registering NaN debugging hooks on transformer model")
-    print("="*60)
-    register_nan_debug_hooks(transformer, prefix="transformer")
-    print("="*60 + "\n")
 
 # Pin models to RAM for faster CPU-GPU transfers (if enabled)
 if ENABLE_PINNED_MEMORY:
@@ -969,32 +562,11 @@ elif USE_TORCH_COMPILE:
     else:
         print(f"\nTorch Compile: Enabled ({TORCH_COMPILE_MODE} mode, {TORCH_COMPILE_BACKEND} backend)")
 
-# Transformer Engine configuration output
-if USE_TRANSFORMER_ENGINE and HAS_TRANSFORMER_ENGINE:
-    if USE_TRANSFORMER_ENGINE_FP8:
-        print(f"\nTransformer Engine: Enabled with FP8 (AMD MI300+)")
-        print(f"  This will reduce memory usage and improve performance with native FP8")
-        print(f"  Linear layers are converted to te.Linear with FP8 autocast")
-        print(f"  Model caching: {'Enabled' if USE_TRANSFORMER_ENGINE_CACHE else 'Disabled'} (faster startup on subsequent runs)")
-        print(f"  Environment variables: FRAMEPACK_USE_TRANSFORMER_ENGINE=1, FRAMEPACK_USE_TRANSFORMER_ENGINE_FP8=1")
-    else:
-        print(f"\nTransformer Engine: Enabled (AMD ROCm - RX 7900 compatible)")
-        print(f"  Optimized kernels without FP8 (RX 7900 doesn't support FP8)")
-        print(f"  Linear layers are converted to te.Linear for better performance")
-        print(f"  Model caching: {'Enabled' if USE_TRANSFORMER_ENGINE_CACHE else 'Disabled'} (faster startup on subsequent runs)")
-        print(f"  Environment variable: FRAMEPACK_USE_TRANSFORMER_ENGINE=1")
-elif USE_TRANSFORMER_ENGINE and not HAS_TRANSFORMER_ENGINE:
-    print(f"\nTransformer Engine: Requested but not available")
-    print(f"  Install with: pip install transformer_engine")
-    print(f"  See: cache/TransformerEngine-dev/README.rst for AMD ROCm installation")
-    USE_TRANSFORMER_ENGINE = False
-
 # Bitsandbytes configuration output
 if USE_BITSANDBYTES and HAS_BITSANDBYTES:
     print(f"\nBitsandbytes 8-bit Optimization: Enabled (AMD ROCm)")
     print(f"  This will reduce memory usage and may improve performance")
     print(f"  Models are quantized during loading with BitsAndBytesConfig")
-    print(f"  Environment variable: FRAMEPACK_USE_BITSANDBYTES=1")
 elif USE_BITSANDBYTES and not HAS_BITSANDBYTES:
     print(f"\nBitsandbytes 8-bit Optimization: Requested but not available")
     print(f"  Install AMD ROCm version with: pip install bitsandbytes")
@@ -1403,11 +975,6 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
     stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
 
-    # Reset NaN detection state for this generation
-    if ENABLE_NAN_DEBUGGING:
-        reset_nan_detection()
-        print("NaN detection reset - monitoring enabled for this generation\n")
-
     flush_rocm_allocator('worker-start')
 
     latent_segments: list[dict] = []
@@ -1436,41 +1003,15 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             fake_diffusers_current_device(text_encoder, gpu)  # since we only encode one text - that is one model move and one encode, offload is same time consumption since it is also one load and one encode.
             load_model_as_complete(text_encoder_2, target_device=gpu)
 
-        # Use Transformer Engine FP8 autocast if enabled (MI300+ only)
-        # For RX 7900, TE layers run without FP8 autocast
-        if USE_TRANSFORMER_ENGINE_FP8 and HAS_TRANSFORMER_ENGINE and te_fp8_recipe is not None:
-            with te.fp8_autocast(enabled=True, fp8_recipe=te_fp8_recipe):
-                llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+        llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
 
-                if cfg == 1:
-                    llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
-                else:
-                    llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+        if cfg == 1:
+            llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
         else:
-            # Standard encoding (TE without FP8, or no TE)
-            llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
-
-            if cfg == 1:
-                llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
-            else:
-                llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+            llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
 
         llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
         llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
-
-        # DEBUG: Check text embeddings for NaN
-        if ENABLE_NAN_DEBUGGING:
-            if torch.isnan(llama_vec).any():
-                nan_count = torch.isnan(llama_vec).sum().item()
-                print(f"\n⚠ WARNING: llama_vec contains {nan_count} NaN values after encoding!")
-                print(f"  Shape: {llama_vec.shape}, Dtype: {llama_vec.dtype}")
-                print(f"  This means the text encoder (LlamaModel) is producing NaN!")
-            if torch.isnan(clip_l_pooler).any():
-                nan_count = torch.isnan(clip_l_pooler).sum().item()
-                print(f"\n⚠ WARNING: clip_l_pooler contains {nan_count} NaN values after encoding!")
-                print(f"  Shape: {clip_l_pooler.shape}, Dtype: {clip_l_pooler.dtype}")
-            if not torch.isnan(llama_vec).any() and not torch.isnan(clip_l_pooler).any():
-                print("✓ Text embeddings are clean (no NaN)")
 
         # Unload text encoders immediately after use (not needed anymore)
         if not high_vram:
@@ -1515,16 +1056,8 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         if not high_vram:
             load_model_as_complete(image_encoder, target_device=gpu)
 
-        # Use Transformer Engine FP8 autocast if enabled (MI300+ only)
-        # For RX 7900, TE layers run without FP8 autocast
-        if USE_TRANSFORMER_ENGINE_FP8 and HAS_TRANSFORMER_ENGINE and te_fp8_recipe is not None:
-            with te.fp8_autocast(enabled=True, fp8_recipe=te_fp8_recipe):
-                image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
-                image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
-        else:
-            # Standard encoding (TE without FP8, or no TE)
-            image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
-            image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
+        image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
+        image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
 
         # Unload image encoder after use (not needed anymore)
         if not high_vram:
@@ -1538,30 +1071,6 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         clip_l_pooler = clip_l_pooler.to(transformer.dtype)
         clip_l_pooler_n = clip_l_pooler_n.to(transformer.dtype)
         image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(transformer.dtype)
-
-        # DEBUG: Check embeddings after dtype conversion
-        if ENABLE_NAN_DEBUGGING:
-            print(f"\n{'='*60}")
-            print(f"Checking embeddings after conversion to {transformer.dtype}")
-            print(f"{'='*60}")
-            if torch.isnan(llama_vec).any():
-                nan_count = torch.isnan(llama_vec).sum().item()
-                print(f"⚠ llama_vec has {nan_count} NaN after .to({transformer.dtype})!")
-            else:
-                print(f"✓ llama_vec clean (shape: {llama_vec.shape})")
-
-            if torch.isnan(clip_l_pooler).any():
-                nan_count = torch.isnan(clip_l_pooler).sum().item()
-                print(f"⚠ clip_l_pooler has {nan_count} NaN after .to({transformer.dtype})!")
-            else:
-                print(f"✓ clip_l_pooler clean (shape: {clip_l_pooler.shape})")
-
-            if torch.isnan(image_encoder_last_hidden_state).any():
-                nan_count = torch.isnan(image_encoder_last_hidden_state).sum().item()
-                print(f"⚠ image_encoder_last_hidden_state has {nan_count} NaN after .to({transformer.dtype})!")
-            else:
-                print(f"✓ image_encoder_last_hidden_state clean (shape: {image_encoder_last_hidden_state.shape})")
-            print(f"{'='*60}\n")
 
         # Sampling
 
@@ -1734,23 +1243,6 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
     # Print MIOpen fallback statistics
     MIOpenFallbackHandler.print_stats()
-
-    # Print NaN detection summary
-    if ENABLE_NAN_DEBUGGING:
-        print("\n" + "="*80)
-        print("NaN DETECTION SUMMARY")
-        print("="*80)
-        if nan_first_detected['layer'] is not None:
-            print(f"⚠ NaN FIRST DETECTED IN: {nan_first_detected['layer']}")
-            stats = nan_first_detected['stats']
-            if stats:
-                print(f"  Shape: {stats['shape']}")
-                print(f"  Dtype: {stats['dtype']}")
-                print(f"  NaN count: {stats['nan_count']:,} ({100*stats['nan_count']/(stats['nan_count']+1):.2f}%)")
-                print(f"  This is likely the root cause of black/corrupted output!")
-        else:
-            print("✓ No NaN values detected during generation")
-        print("="*80 + "\n")
 
     stream.output_queue.push(('end', None))
     return
