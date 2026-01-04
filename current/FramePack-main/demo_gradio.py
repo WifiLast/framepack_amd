@@ -171,6 +171,8 @@ from diffusers_helper.hunyuan import encode_prompt_conds, vae_decode, vae_encode
 from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, state_dict_weighted_merge, state_dict_offset_merge, generate_timestamp
 from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
 from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
+from diffusers_helper.fbcache import FirstBlockCache, FirstBlockCacheConfig
+from diffusers_helper.magcache_video import MagCacheConfig, MagCacheVideo
 from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete
 # Try to import log_memory_status (only available in AMD version)
 try:
@@ -216,7 +218,7 @@ def _env_flag(name: str, default: str = '0') -> bool:
 USE_BITSANDBYTES = _env_flag('FRAMEPACK_USE_BITSANDBYTES', '1')  # Enabled by default
 
 # AMD TransformerEngine optimization configuration
-USE_AMD_TE = _env_flag('FRAMEPACK_USE_AMD_TE', '1')  # Disabled by default (experimental)
+USE_AMD_TE = _env_flag('FRAMEPACK_USE_AMD_TE', '0')  # Disabled by default (experimental)
 
 
 def get_quantization_config():
@@ -1114,7 +1116,7 @@ def flush_rocm_allocator(stage: str = '', min_resident_gb: float = 0.0) -> bool:
 
 
 @torch.no_grad()
-def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
+def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, use_fbcache, use_magcache, mp4_crf):
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
@@ -1133,6 +1135,17 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         'version': LATENTS_EXPORT_VERSION,
     }
     latent_padding_history: list[int] = []
+
+    first_block_cache = None
+    if use_fbcache:
+        first_block_cache = FirstBlockCache(FirstBlockCacheConfig())
+        transformer.set_first_block_cache(first_block_cache)
+        print(f'[FBCache] Enabled (threshold={first_block_cache.config.threshold:.4f})')
+    else:
+        transformer.set_first_block_cache(None)
+
+    magcache: Optional[MagCacheVideo] = None
+    transformer.set_magcache(None)
 
     try:
         # Clean GPU
@@ -1182,6 +1195,22 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         input_image_pt = _to_gpu_channels_last(input_image_pt, gpu, dtype=vae.dtype)
 
         image_cache_key = image_to_cache_key(input_image_np)
+
+        if use_magcache:
+            magcache_config = MagCacheConfig(
+                enabled=True,
+                threshold=0.24,
+                max_skip_steps=6,
+                retention_ratio=0.2,
+                default_height=height,
+                cache_on_cpu=not high_vram,
+            )
+            magcache = MagCacheVideo(magcache_config)
+            magcache.configure(num_steps=steps, video_height=height)
+            transformer.set_magcache(magcache)
+            print(f'[MagCache] Enabled (threshold={magcache_config.threshold:.2f}, max_skip={magcache_config.max_skip_steps})')
+        else:
+            transformer.set_magcache(None)
 
         # VAE encoding
 
@@ -1272,7 +1301,11 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                     log_memory_status(gpu, prefix="[Before Transformer Load] ")
                 move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
 
-            if use_teacache:
+            if use_magcache:
+                transformer.initialize_teacache(enable_teacache=False)
+            elif use_fbcache:
+                transformer.initialize_teacache(enable_teacache=False)
+            elif use_teacache:
                 transformer.initialize_teacache(enable_teacache=True, num_steps=steps)
             else:
                 transformer.initialize_teacache(enable_teacache=False)
@@ -1326,6 +1359,17 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 callback=callback,
             )
             generated_latents = _ensure_channels_last_3d(generated_latents)
+            if first_block_cache is not None:
+                hits = first_block_cache.stats.get('hits', 0)
+                misses = first_block_cache.stats.get('misses', 0)
+                ratio = first_block_cache._last_diff if hasattr(first_block_cache, '_last_diff') else None
+                ratio_str = f', last diff={ratio:.4f}' if isinstance(ratio, (int, float)) else ''
+                print(f'[FBCache] stats: hits={hits}, misses={misses}{ratio_str}')
+            if magcache is not None:
+                stats = magcache.stats
+                skips = stats.get('skips', 0)
+                full = stats.get('full_pass', 0)
+                print(f'[MagCache] stats: skips={skips}, full_pass={full}, last_err={magcache.last_error:.4f}')
 
             segment_latents = generated_latents
             if is_last_section:
@@ -1393,6 +1437,8 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
     except:
         traceback.print_exc()
     finally:
+        transformer.set_first_block_cache(None)
+        transformer.set_magcache(None)
         # Clean up models and GPU memory after completion or exception
         if not high_vram:
             unload_complete_models(
@@ -1407,7 +1453,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
     return
 
 
-def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
+def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, use_fbcache, use_magcache, mp4_crf):
     global stream
     assert input_image is not None, 'No input image!'
 
@@ -1437,7 +1483,7 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
 
     stream = AsyncStream()
 
-    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf)
+    async_run(worker, input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, use_fbcache, use_magcache, mp4_crf)
 
     output_filename = None
 
@@ -1510,6 +1556,8 @@ with block:
 
             with gr.Group():
                 use_teacache = gr.Checkbox(label='Use TeaCache', value=True, info='Faster speed, but often makes hands and fingers slightly worse.')
+                use_fbcache = gr.Checkbox(label='Use First Block Cache', value=True, info='Experimental cache for transformer first block to reuse residuals between denoising steps.')
+                use_magcache = gr.Checkbox(label='Use MagCache', value=False, info='Skip full transformer passes when residual magnitudes remain stable (experimental).')
 
                 n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=False)  # Not used
                 seed = gr.Number(label="Seed", value=31337, precision=0)
@@ -1535,7 +1583,7 @@ with block:
 
     gr.HTML('<div style="text-align:center; margin-top:20px;">Share your results and find ideas at the <a href="https://x.com/search?q=framepack&f=live" target="_blank">FramePack Twitter (X) thread</a></div>')
 
-    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf]
+    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, use_fbcache, use_magcache, mp4_crf]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
     end_button.click(fn=end_process)
 

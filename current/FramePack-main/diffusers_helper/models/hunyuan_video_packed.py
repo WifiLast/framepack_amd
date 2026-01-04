@@ -15,6 +15,8 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps, PixArtAlph
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers_helper.dit_common import LayerNorm
+from diffusers_helper.fbcache import FirstBlockCache
+from diffusers_helper.magcache_video import MagCacheVideo
 from diffusers_helper.utils import zero_module
 
 
@@ -817,6 +819,8 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
         self.inner_dim = inner_dim
         self.use_gradient_checkpointing = False
         self.enable_teacache = False
+        self.first_block_cache: Optional[FirstBlockCache] = None
+        self.magcache: Optional[MagCacheVideo] = None
 
         if has_image_proj:
             self.install_image_projection(image_proj_dim)
@@ -843,7 +847,7 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
         self.use_gradient_checkpointing = False
         print('self.use_gradient_checkpointing = False')
 
-    def initialize_teacache(self, enable_teacache=True, num_steps=25, rel_l1_thresh=0.15):
+    def initialize_teacache(self, enable_teacache=True, num_steps=25, rel_l1_thresh=0.05):
         self.enable_teacache = enable_teacache
         self.cnt = 0
         self.num_steps = num_steps
@@ -852,6 +856,16 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
         self.previous_modulated_input = None
         self.previous_residual = None
         self.teacache_rescale_func = np.poly1d([7.33226126e+02, -4.01131952e+02, 6.75869174e+01, -3.14987800e+00, 9.61237896e-02])
+
+    def set_first_block_cache(self, cache: Optional[FirstBlockCache]):
+        self.first_block_cache = cache
+        if self.first_block_cache is not None:
+            self.first_block_cache.reset()
+
+    def set_magcache(self, cache: Optional[MagCacheVideo]):
+        self.magcache = cache
+        if self.magcache is not None:
+            self.magcache.reset_cycle()
 
     def gradient_checkpointing_method(self, block, *args):
         if self.use_gradient_checkpointing:
@@ -971,31 +985,74 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
 
             attention_mask = cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv
 
-        if self.enable_teacache:
-            modulated_inp = self.transformer_blocks[0].norm1(hidden_states, emb=temb)[0]
+        magcache = self.magcache if self.magcache is not None and self.magcache.config.enabled else None
+        skip_transformer = False
+        if magcache is not None:
+            hidden_states, encoder_hidden_states, skip_transformer = magcache.maybe_skip(
+                hidden_states,
+                encoder_hidden_states,
+            )
 
-            if self.cnt == 0 or self.cnt == self.num_steps-1:
-                should_calc = True
-                self.accumulated_rel_l1_distance = 0
-            else:
-                curr_rel_l1 = ((modulated_inp - self.previous_modulated_input).abs().mean() / self.previous_modulated_input.abs().mean()).cpu().item()
-                self.accumulated_rel_l1_distance += self.teacache_rescale_func(curr_rel_l1)
-                should_calc = self.accumulated_rel_l1_distance >= self.rel_l1_thresh
+        if not skip_transformer:
+            cache = self.first_block_cache
+            if cache is not None and cache.config.enabled:
+                hidden_states, encoder_hidden_states = cache.maybe_run(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    attention_mask=attention_mask,
+                    rope_freqs=rope_freqs,
+                    transformer_blocks=self.transformer_blocks,
+                    single_transformer_blocks=self.single_transformer_blocks,
+                    grad_ckpt_fn=self.gradient_checkpointing_method,
+                )
+            elif self.enable_teacache:
+                modulated_inp = self.transformer_blocks[0].norm1(hidden_states, emb=temb)[0]
 
-                if should_calc:
+                if self.cnt == 0 or self.cnt == self.num_steps-1:
+                    should_calc = True
                     self.accumulated_rel_l1_distance = 0
+                else:
+                    curr_rel_l1 = ((modulated_inp - self.previous_modulated_input).abs().mean() / self.previous_modulated_input.abs().mean()).cpu().item()
+                    self.accumulated_rel_l1_distance += self.teacache_rescale_func(curr_rel_l1)
+                    should_calc = self.accumulated_rel_l1_distance >= self.rel_l1_thresh
 
-            self.previous_modulated_input = modulated_inp
-            self.cnt += 1
+                    if should_calc:
+                        self.accumulated_rel_l1_distance = 0
 
-            if self.cnt == self.num_steps:
-                self.cnt = 0
+                self.previous_modulated_input = modulated_inp
+                self.cnt += 1
 
-            if not should_calc:
-                hidden_states = hidden_states + self.previous_residual
+                if self.cnt == self.num_steps:
+                    self.cnt = 0
+
+                if not should_calc:
+                    hidden_states = hidden_states + self.previous_residual
+                else:
+                    ori_hidden_states = hidden_states.clone()
+
+                    for block_id, block in enumerate(self.transformer_blocks):
+                        hidden_states, encoder_hidden_states = self.gradient_checkpointing_method(
+                            block,
+                            hidden_states,
+                            encoder_hidden_states,
+                            temb,
+                            attention_mask,
+                            rope_freqs
+                        )
+
+                    for block_id, block in enumerate(self.single_transformer_blocks):
+                        hidden_states, encoder_hidden_states = self.gradient_checkpointing_method(
+                            block,
+                            hidden_states,
+                            encoder_hidden_states,
+                            temb,
+                            attention_mask,
+                            rope_freqs
+                        )
+
+                    self.previous_residual = hidden_states - ori_hidden_states
             else:
-                ori_hidden_states = hidden_states.clone()
-
                 for block_id, block in enumerate(self.transformer_blocks):
                     hidden_states, encoder_hidden_states = self.gradient_checkpointing_method(
                         block,
@@ -1016,26 +1073,10 @@ class HunyuanVideoTransformer3DModelPacked(ModelMixin, ConfigMixin, PeftAdapterM
                         rope_freqs
                     )
 
-                self.previous_residual = hidden_states - ori_hidden_states
-        else:
-            for block_id, block in enumerate(self.transformer_blocks):
-                hidden_states, encoder_hidden_states = self.gradient_checkpointing_method(
-                    block,
+            if magcache is not None:
+                hidden_states, encoder_hidden_states = magcache.finalize(
                     hidden_states,
                     encoder_hidden_states,
-                    temb,
-                    attention_mask,
-                    rope_freqs
-                )
-
-            for block_id, block in enumerate(self.single_transformer_blocks):
-                hidden_states, encoder_hidden_states = self.gradient_checkpointing_method(
-                    block,
-                    hidden_states,
-                    encoder_hidden_states,
-                    temb,
-                    attention_mask,
-                    rope_freqs
                 )
 
         hidden_states = self.gradient_checkpointing_method(self.norm_out, hidden_states, temb)
