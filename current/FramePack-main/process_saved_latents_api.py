@@ -198,7 +198,13 @@ def reconstruct_video_from_segments(
                 print(f'  Initial decode complete, pixel frames: {history_pixels.shape[2]}')
         else:
             is_last_section = bool(segment.get('is_last_section'))
-            section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
+            expected_section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
+            section_latent_frames = int(segment_latent_frames)
+            if verbose and section_latent_frames != expected_section_latent_frames:
+                print(
+                    f'  Warning: segment latent frames {section_latent_frames} != expected {expected_section_latent_frames}; '
+                    f'using actual segment length for decode'
+                )
             current_latents = real_history_latents[:, :, :section_latent_frames, :, :]
             if verbose:
                 print(f'  Decoding segment (latent frames: {current_latents.shape[2]}, last={is_last_section})...')

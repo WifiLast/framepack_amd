@@ -77,8 +77,8 @@ def get_default_mag_ratios(video_height: int) -> np.ndarray:
 @dataclass
 class MagCacheConfig:
     enabled: bool = False
-    threshold: float = 0.24
-    max_skip_steps: int = 6
+    threshold: float = 0.18
+    max_skip_steps: int = 2
     retention_ratio: float = 0.2
     default_height: int = 640
     custom_ratios: Optional[Sequence[float]] = None

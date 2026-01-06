@@ -75,6 +75,7 @@ import numpy as np
 import argparse
 import math
 from typing import Optional
+import itertools
 
 
 # last set if errors occurs this is the reason 
@@ -1117,8 +1118,12 @@ def flush_rocm_allocator(stage: str = '', min_resident_gb: float = 0.0) -> bool:
 
 @torch.no_grad()
 def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, use_fbcache, use_magcache, mp4_crf):
-    total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
-    total_latent_sections = int(max(round(total_latent_sections), 1))
+    unlimited_length = total_second_length <= 0
+    if unlimited_length:
+        total_latent_sections = None
+    else:
+        total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
+        total_latent_sections = int(max(round(total_latent_sections), 1))
 
     job_id = generate_timestamp()
 
@@ -1264,15 +1269,19 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         history_pixels = None
         total_generated_latent_frames = 0
 
-        latent_paddings = reversed(range(total_latent_sections))
+        if unlimited_length:
+            latent_paddings = itertools.chain([3], itertools.repeat(2))
+        else:
+            latent_paddings = reversed(range(total_latent_sections))
 
-        if total_latent_sections > 4:
+        if not unlimited_length and total_latent_sections > 4:
             # In theory the latent_paddings should follow the above sequence, but it seems that duplicating some
             # items looks better than expanding it when total_latent_sections > 4
             # One can try to remove below trick and just
             # use `latent_paddings = list(reversed(range(total_latent_sections)))` to compare
             latent_paddings = [3] + [2] * (total_latent_sections - 3) + [1, 0]
 
+        first_section = True
         for latent_padding in latent_paddings:
             is_last_section = latent_padding == 0
             latent_padding_size = latent_padding * latent_window_size
@@ -1296,8 +1305,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 unload_complete_models()
                 flush_rocm_allocator('post-unload/transformer')
                 # Log memory status on first iteration for debugging
-                latent_paddings_list = list(latent_paddings)
-                if latent_paddings_list and latent_padding == latent_paddings_list[0]:
+                if first_section:
                     log_memory_status(gpu, prefix="[Before Transformer Load] ")
                 move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
 
@@ -1382,6 +1390,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
             })
 
             total_generated_latent_frames += int(segment_latents.shape[2])
+            first_section = False
 
             if SKIP_IMMEDIATE_DECODE:
                 if is_last_section:
@@ -1562,7 +1571,7 @@ with block:
                 n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=False)  # Not used
                 seed = gr.Number(label="Seed", value=31337, precision=0)
 
-                total_second_length = gr.Slider(label="Total Video Length (Seconds)", minimum=1, maximum=120, value=5, step=0.1)
+                total_second_length = gr.Slider(label="Total Video Length (Seconds)", minimum=0, maximum=120, value=5, step=0.1, info="Set to 0 for unlimited generation.")
                 latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=False)  # Should not change
                 steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Changing this value is not recommended.')
 
