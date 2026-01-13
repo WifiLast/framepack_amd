@@ -1,16 +1,34 @@
 # By lllyasviel
 
 import time
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+from pathlib import Path
 
 import torch
+
+# Import DuckDB storage for persistent model offloading
+try:
+    from .duckdb_storage import DuckDBStorage
+    DUCKDB_AVAILABLE = True
+except ImportError:
+    try:
+        from duckdb_storage import DuckDBStorage
+        DUCKDB_AVAILABLE = True
+    except ImportError:
+        DUCKDB_AVAILABLE = False
+        DuckDBStorage = None
 
 
 cpu: torch.device = torch.device('cpu')
 gpu: torch.device = torch.device(f'cuda:{torch.cuda.current_device()}')
 gpu_complete_modules: List[torch.nn.Module] = []
 _MEM_STATS_CACHE: Dict[int, tuple[float, float]] = {}
+
+# Global DuckDB storage instance for persistent offloading
+_DUCKDB_STORAGE: Optional[DuckDBStorage] = None
+_DUCKDB_MODEL_CACHE: Dict[str, bool] = {}  # Track which models are in DuckDB
 
 
 @dataclass
@@ -21,6 +39,13 @@ class MemoryOptimizationConfig:
     use_pinned_memory: bool = False
     cache_memory_stats: bool = False
     stats_cache_ttl: float = 0.05
+    
+    # DuckDB persistent storage options
+    use_duckdb_storage: bool = False
+    duckdb_path: str = "model_cache.duckdb"
+    duckdb_memory_limit: str = "4GB"
+    persist_on_offload: bool = True  # Store to DuckDB when offloading from GPU
+    clear_cpu_after_duckdb: bool = True  # Free CPU RAM after storing to DuckDB
 
     def enable_async_copy(self) -> bool:
         return self.use_async_streams and torch.cuda.is_available()
@@ -62,6 +87,205 @@ def _cached_available_bytes(device: torch.device, optim: Optional[MemoryOptimiza
     total = bytes_free_cuda + bytes_inactive_reserved
     _MEM_STATS_CACHE[idx] = (now, total)
     return total
+
+
+# ==================== DuckDB Persistent Storage Functions ====================
+
+def initialize_duckdb_storage(optim_config: Optional[MemoryOptimizationConfig] = None) -> None:
+    ""Initialize DuckDB storage for persistent model offloading.
+    
+    Args:
+        optim_config: Memory optimization configuration with DuckDB settings.
+    """
+    global _DUCKDB_STORAGE
+    
+    if not DUCKDB_AVAILABLE:
+        print("[Warning] DuckDB storage not available. Install duckdb and pyarrow.")
+        return
+    
+    if _DUCKDB_STORAGE is not None:
+        return  # Already initialized
+    
+    config = optim_config or MemoryOptimizationConfig()
+    
+    if not config.use_duckdb_storage:
+        return
+    
+    try:
+        db_path = config.duckdb_path
+        memory_limit = config.duckdb_memory_limit
+        
+        print(f'[DuckDB] Initializing storage: {db_path} (memory limit: {memory_limit})')
+        _DUCKDB_STORAGE = DuckDBStorage(db_path, memory_limit=memory_limit)
+        print(f'[DuckDB] Storage initialized successfully')
+    except Exception as e:
+        print(f'[DuckDB Error] Failed to initialize storage: {e}')
+        _DUCKDB_STORAGE = None
+
+
+def get_duckdb_storage() -> Optional[DuckDBStorage]:
+    """Get the global DuckDB storage instance."""
+    return _DUCKDB_STORAGE
+
+
+def _get_model_key(model: torch.nn.Module) -> str:
+    """Generate a unique key for a model based on its class name and id."""
+    return f"{model.__class__.__name__}_{id(model)}"
+
+
+def offload_model_to_duckdb(
+    model: torch.nn.Module,
+    model_key: Optional[str] = None,
+    optim_config: Optional[MemoryOptimizationConfig] = None,
+) -> bool:
+    """Offload a model's parameters to DuckDB persistent storage.
+    
+    This frees CPU RAM by storing model weights on disk. The model structure
+    remains in memory but all parameter tensors are moved to DuckDB.
+    
+    Args:
+        model: PyTorch model to offload.
+        model_key: Optional custom key. If None, uses model class name + id.
+        optim_config: Memory optimization configuration.
+        
+    Returns:
+        True if successful, False otherwise.
+    """
+    global _DUCKDB_MODEL_CACHE
+    
+    if not DUCKDB_AVAILABLE:
+        return False
+    
+    # Initialize storage if needed
+    if _DUCKDB_STORAGE is None:
+        initialize_duckdb_storage(optim_config)
+        if _DUCKDB_STORAGE is None:
+            return False
+    
+    config = optim_config or MemoryOptimizationConfig()
+    key = model_key or _get_model_key(model)
+    
+    try:
+        print(f'[DuckDB] Offloading {model.__class__.__name__} to persistent storage...')
+        
+        # Collect all parameters and buffers
+        state_dict = {}
+        for name, param in model.named_parameters():
+            if param is not None:
+                # Move to CPU first if on GPU
+                state_dict[name] = param.detach().cpu()
+        
+        for name, buffer in model.named_buffers():
+            if buffer is not None:
+                state_dict[name] = buffer.detach().cpu()
+        
+        # Store to DuckDB using batched operation
+        _DUCKDB_STORAGE.store_tensors_batched(
+            key, 
+            state_dict,
+            use_pinned=config.use_pinned_memory
+        )
+        
+        # Mark as cached in DuckDB
+        _DUCKDB_MODEL_CACHE[key] = True
+        
+        # Optionally clear CPU memory
+        if config.clear_cpu_after_duckdb:
+            # Replace parameters with None to free memory
+            for name, param in model.named_parameters():
+                if param is not None:
+                    param.data = torch.empty(0)
+            
+            for name, buffer in model.named_buffers():
+                if buffer is not None:
+                    buffer.data = torch.empty(0)
+            
+            torch.cuda.empty_cache()
+        
+        print(f'[DuckDB] Model offloaded successfully (key: {key})')
+        return True
+        
+    except Exception as e:
+        print(f'[DuckDB Error] Failed to offload model: {e}')
+        return False
+
+
+def restore_model_from_duckdb(
+    model: torch.nn.Module,
+    target_device: torch.device = cpu,
+    model_key: Optional[str] = None,
+) -> bool:
+    """Restore a model's parameters from DuckDB storage.
+    
+    Args:
+        model: PyTorch model to restore (must have same structure as stored).
+        target_device: Device to load parameters to (cpu or cuda).
+        model_key: Optional custom key. If None, uses model class name + id.
+        
+    Returns:
+        True if successful, False otherwise.
+    """
+    global _DUCKDB_MODEL_CACHE
+    
+    if not DUCKDB_AVAILABLE or _DUCKDB_STORAGE is None:
+        return False
+    
+    key = model_key or _get_model_key(model)
+    
+    if key not in _DUCKDB_MODEL_CACHE:
+        print(f'[DuckDB] Model key {key} not found in cache')
+        return False
+    
+    try:
+        print(f'[DuckDB] Restoring {model.__class__.__name__} from persistent storage...')
+        
+        # Retrieve all tensors from DuckDB
+        state_dict = _DUCKDB_STORAGE.get_tensors_batched(key, device=target_device)
+        
+        # Restore parameters
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if name in state_dict:
+                    param.data = state_dict[name]
+            
+            for name, buffer in model.named_buffers():
+                if name in state_dict:
+                    buffer.data = state_dict[name]
+        
+        print(f'[DuckDB] Model restored successfully to {target_device}')
+        return True
+        
+    except Exception as e:
+        print(f'[DuckDB Error] Failed to restore model: {e}')
+        return False
+
+
+def is_model_in_duckdb(model: torch.nn.Module, model_key: Optional[str] = None) -> bool:
+    """Check if a model is stored in DuckDB.
+    
+    Args:
+        model: Model to check.
+        model_key: Optional custom key.
+        
+    Returns:
+        True if model is in DuckDB, False otherwise.
+    """
+    key = model_key or _get_model_key(model)
+    return key in _DUCKDB_MODEL_CACHE
+
+
+def clear_duckdb_cache() -> None:
+    """Clear all models from DuckDB storage and reset cache."""
+    global _DUCKDB_MODEL_CACHE, _DUCKDB_STORAGE
+    
+    if _DUCKDB_STORAGE is not None:
+        try:
+            _DUCKDB_STORAGE.clear_all()
+            print('[DuckDB] Cache cleared')
+        except Exception as e:
+            print(f'[DuckDB Error] Failed to clear cache: {e}')
+    
+    _DUCKDB_MODEL_CACHE.clear()
 
 
 class DynamicSwapInstaller:
