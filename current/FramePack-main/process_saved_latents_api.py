@@ -98,6 +98,14 @@ def load_vae(device: torch.device, enable_tiling: bool = True, enable_slicing: b
     vae.to(device=device, dtype=torch.float16)
     vae.to(memory_format=CHANNELS_LAST_3D)
 
+    # Enable flash attention for improved memory efficiency and speed
+    if hasattr(vae, 'enable_xformers_memory_efficient_attention'):
+        try:
+            vae.enable_xformers_memory_efficient_attention()
+            print('Flash attention (xformers) enabled')
+        except Exception as e:
+            print(f'Flash attention not available: {e}')
+
     if enable_tiling and hasattr(vae, 'enable_tiling'):
         vae.enable_tiling()
         print('VAE tiling enabled')
@@ -453,7 +461,7 @@ Then send POST requests to:
         '''
     )
     parser.add_argument('--host', default='0.0.0.0', help='Host to bind the server. Default: 0.0.0.0')
-    parser.add_argument('--port', type=int, default=7860, help='Port to bind the server. Default: 7860')
+    parser.add_argument('--port', type=int, default=7861 ,help='Port to bind the server. Default: 7860')
     parser.add_argument('--device', default='cuda:0', help='Device for VAE decoding (e.g., cuda:0, cuda:1, or cpu). Default: cuda:0')
     parser.add_argument('--output-dir', default='./outputs', help='Directory for output videos. Default: ./outputs')
     parser.add_argument('--enable-slicing', action='store_true', help='Enable VAE slicing by default for lower VRAM usage.')

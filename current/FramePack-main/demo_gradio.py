@@ -986,7 +986,7 @@ os.makedirs(outputs_folder, exist_ok=True)
 
 # REST API configuration for latent processing
 LATENT_API_ENABLED = _env_flag('FRAMEPACK_LATENT_API_ENABLED', '1')  # Disabled by default
-LATENT_API_URL = os.environ.get('FRAMEPACK_LATENT_API_URL', 'http://localhost:7860')  # Different port from gradio
+LATENT_API_URL = os.environ.get('FRAMEPACK_LATENT_API_URL', 'http://localhost:7861')  # Different port from gradio
 
 
 def send_latents_to_api(latents_file: str, job_id: str, verbose: bool = True) -> Optional[str]:

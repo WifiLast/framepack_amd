@@ -37,6 +37,14 @@ def load_vae(device: torch.device, enable_tiling: bool = True, enable_slicing: b
     vae.to(device=device, dtype=torch.float16)
     vae.to(memory_format=CHANNELS_LAST_3D)
 
+    # Enable flash attention for improved memory efficiency and speed
+    if hasattr(vae, 'enable_xformers_memory_efficient_attention'):
+        try:
+            vae.enable_xformers_memory_efficient_attention()
+            print('Flash attention (xformers) enabled')
+        except Exception as e:
+            print(f'Flash attention not available: {e}')
+
     if enable_tiling and hasattr(vae, 'enable_tiling'):
         vae.enable_tiling()
         print('VAE tiling enabled')
